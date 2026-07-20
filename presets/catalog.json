@@ -1,0 +1,231 @@
+{
+  "version": 1,
+  "games": [
+    {
+      "id": "genshin",
+      "name": "原神",
+      "game_processes": ["YuanShen.exe", "GenshinImpact.exe"],
+      "doc_url": "https://www.bettergi.com/",
+      "download_url": "https://github.com/babalae/better-genshin-impact/releases",
+      "scripts": [
+        {
+          "id": "bettergi_onedragon",
+          "name": "BetterGI · 一条龙",
+          "launcher_filename": "BetterGI.exe",
+          "launcher_globs": ["**/BetterGI/BetterGI.exe", "**/BetterGI.exe"],
+          "launcher_hints": [
+            "E:\\Games\\py\\BetterGI\\BetterGI.exe",
+            "C:\\BetterGI\\BetterGI.exe"
+          ],
+          "args": ["startOneDragon"],
+          "wait_mode": "game",
+          "helper_processes": ["BetterGI.exe"],
+          "start_timeout_min": 15,
+          "setup_checklist": [
+            "在 BetterGI：设置 → 一条龙 → 结束后操作 → 关闭游戏",
+            "在 BetterGI：一条龙任务勾选你需要的日常（合成树脂、秘境等）"
+          ],
+          "notes": "命令行 startOneDragon；需脚本内开启完成后关游戏。"
+        }
+      ]
+    },
+    {
+      "id": "hsr",
+      "name": "崩坏：星穹铁道",
+      "game_processes": ["StarRail.exe"],
+      "doc_url": "https://m7a.top/",
+      "download_url": "https://github.com/moesnow/March7thAssistant/releases",
+      "scripts": [
+        {
+          "id": "m7a_main",
+          "name": "March7th · 完整运行",
+          "launcher_filename": "March7th Launcher.exe",
+          "launcher_globs": [
+            "**/March7th Launcher.exe",
+            "**/March7thAssistant*/March7th Launcher.exe"
+          ],
+          "launcher_hints": [
+            "E:\\Games\\py\\March7thAssistant_full\\March7th Launcher.exe"
+          ],
+          "args": ["main", "-e"],
+          "wait_mode": "game",
+          "helper_processes": ["March7th Launcher.exe", "March7th Assistant.exe"],
+          "start_timeout_min": 15,
+          "setup_checklist": [
+            "config.yaml：after_finish: Exit（完成后退出游戏）",
+            "config.yaml：pause_after_success: false"
+          ],
+          "notes": "完整运行 main -e；任务完成后助手自动退出。"
+        }
+      ]
+    },
+    {
+      "id": "zzz",
+      "name": "绝区零",
+      "game_processes": ["ZenlessZoneZero.exe"],
+          "doc_url": "https://one-dragon.com/zzz/zh/home.html",
+          "download_url": "https://github.com/OneDragon-Anything/ZenlessZoneZero-OneDragon/releases",
+      "scripts": [
+        {
+          "id": "onedragon",
+          "name": "OneDragon · 一条龙",
+          "launcher_filename": "OneDragon-Launcher.exe",
+          "launcher_globs": [
+            "**/OneDragon-Launcher.exe",
+            "**/zzz/OneDragon-Launcher.exe"
+          ],
+          "launcher_hints": [
+            "E:\\Games\\py\\zzz\\OneDragon-Launcher.exe"
+          ],
+          "args": ["-o", "--close-game"],
+          "wait_mode": "game",
+          "helper_processes": ["OneDragon-Launcher.exe"],
+          "start_timeout_min": 15,
+          "setup_checklist": [
+            "在 OneDragon 界面勾选需要的一条龙应用"
+          ],
+          "notes": "命令行 -o --close-game 自动关游戏。"
+        }
+      ]
+    },
+    {
+      "id": "arknights",
+      "name": "明日方舟",
+      "game_processes": [],
+      "doc_url": "https://docs.maa.plus/",
+      "download_url": "https://github.com/MaaAssistantArknights/MaaAssistantArknights/releases",
+      "scripts": [
+        {
+          "id": "maa_gui",
+          "name": "MAA · 一键长草（MuMu/ADB）",
+          "launcher_filename": "MAA.exe",
+          "launcher_globs": ["**/MAA.exe", "**/MAA-v*/MAA.exe"],
+          "launcher_hints": [
+            "D:\\新建文件夹\\Google\\MAA-v5.16.8-win-x64\\MAA.exe",
+            "D:\\Google\\MAA-v5.16.8-win-x64\\MAA.exe"
+          ],
+          "args": [],
+          "wait_mode": "helper",
+          "helper_processes": ["MAA.exe"],
+          "start_timeout_min": 15,
+          "setup_checklist": [
+            "MAA：启动后自动开始任务",
+            "MAA：启动后自动开模拟器",
+            "MAA：完成后退出模拟器 + 退出 MAA"
+          ],
+          "notes": "游戏在模拟器内；等 MAA 自己退出即可。"
+        }
+      ]
+    },
+    {
+      "id": "endfield",
+      "name": "明日方舟：终末地",
+      "game_processes": ["Endfield.exe"],
+      "doc_url": "https://github.com/MaaXYZ/MaaEnd",
+      "download_url": "https://github.com/MaaXYZ/MaaEnd/releases",
+      "scripts": [
+        {
+          "id": "maaend_gui",
+          "name": "MaaEnd · 一键长草（PC 端）",
+          "launcher_filename": "MaaEnd.exe",
+          "launcher_globs": ["**/MaaEnd.exe", "**/MaaEnd/MaaEnd.exe"],
+          "launcher_hints": [
+            "E:\\Games\\py\\MaaEnd\\MaaEnd.exe"
+          ],
+          "args": [],
+          "wait_mode": "helper",
+          "helper_processes": ["MaaEnd.exe"],
+          "start_timeout_min": 15,
+          "pre_launcher": "E:\\open\\Hypergryph Launcher\\games\\Arknights Endfield\\Endfield.exe",
+          "pre_args": [],
+          "pre_delay_sec": 30,
+          "setup_checklist": [
+            "MaaEnd：设置 → 启动后自动开始任务",
+            "MaaEnd：任务末尾添加后置「结束进程 Endfield.exe」+「退出 MaaEnd」",
+            "编辑页高级选项：前置程序填终末地游戏本体 Endfield.exe（MaaEnd 自身启动游戏有 bug）"
+          ],
+          "notes": "MaaEnd 无法自行开游戏：助手先启动 Endfield.exe，等 30 秒再启动 MaaEnd，等它自己退出。"
+        }
+      ]
+    },
+    {
+      "id": "wuwa",
+      "name": "鸣潮",
+      "game_processes": ["Client-Win64-Shipping.exe", "Wuthering Waves.exe"],
+      "doc_url": "https://github.com/ok-oldking/ok-wuthering-waves",
+      "download_url": "https://github.com/ok-oldking/ok-wuthering-waves/releases",
+      "scripts": [
+        {
+          "id": "okww_daily",
+          "name": "ok-ww · 日常一条龙",
+          "launcher_filename": "ok-ww.exe",
+          "launcher_globs": ["**/ok-ww.exe", "**/ok-wuthering-waves/**/ok-ww.exe"],
+          "launcher_hints": [
+            "E:\\Games\\py\\ok-ww\\ok-ww.exe",
+            "C:\\Program Files\\ok-ww\\ok-ww.exe",
+            "D:\\Games\\ok-ww\\ok-ww.exe"
+          ],
+          "args": ["-t", "1", "-e"],
+          "wait_mode": "game",
+          "helper_processes": ["ok-ww.exe"],
+          "start_timeout_min": 20,
+          "setup_checklist": [
+            "在 ok-ww 任务列表中将「日常一条龙」放在第 1 项（对应 -t 1）",
+            "在 ok-ww 设置中开启任务完成后关闭游戏（便于串行切换）",
+            "安装路径建议纯英文；杀毒软件加入白名单"
+          ],
+          "notes": "命令行 -t 1 -e：执行第 1 个任务并退出助手。"
+        }
+      ]
+    },
+    {
+      "id": "reverse1999",
+      "name": "重返未来：1999",
+      "game_processes": [],
+      "doc_url": "https://1999.fan/zh_cn/",
+      "download_url": "https://github.com/MAA1999/M9A/releases",
+      "scripts": [
+        {
+          "id": "m9a_cli",
+          "name": "M9A · MaaPiCli 一键日常",
+          "launcher_filename": "MaaPiCli.exe",
+          "launcher_globs": ["**/MaaPiCli.exe", "**/M9A*/MaaPiCli.exe"],
+          "launcher_hints": [
+            "E:\\Games\\py\\M9A\\MaaPiCli.exe",
+            "E:\\Games\\py\\M9A\\MaaPiCli\\MaaPiCli.exe"
+          ],
+          "args": ["-d"],
+          "wait_mode": "helper",
+          "helper_processes": ["MaaPiCli.exe", "MFAAvalonia.exe", "MXU.exe"],
+          "start_timeout_min": 20,
+          "setup_checklist": [
+            "先用 MFAAvalonia/MXU 图形界面配置 MaaPiCli 任务队列（含日常与「关闭游戏」）",
+            "确认 config/maa_pi_config.json 已保存；游戏内语言设为简体中文",
+            "模拟器/MuMu 连接配置完成；MaaPiCli.exe -d 跑完后进程会自动退出"
+          ],
+          "notes": "需预先在 M9A 内配好任务列表；命令行 -d 直接运行并结束。"
+        }
+      ]
+    },
+    {
+      "id": "custom",
+      "name": "其他 / 自定义",
+      "game_processes": [],
+      "scripts": [
+        {
+          "id": "manual",
+          "name": "手动填写全部项",
+          "launcher_filename": "",
+          "launcher_globs": [],
+          "launcher_hints": [],
+          "args": [],
+          "wait_mode": "game",
+          "helper_processes": [],
+          "start_timeout_min": 15,
+          "setup_checklist": [],
+          "notes": "适合列表外的游戏，保存后可在编辑页展开高级选项。"
+        }
+      ]
+    }
+  ]
+}

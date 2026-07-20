@@ -1,0 +1,40 @@
+# 粘贴快速填充 — 格式样例
+# 复制以下内容到「粘贴填充」弹窗，修改路径后点「确认填充」
+
+名称: 原神 · BetterGI · 一条龙
+游戏: 原神
+脚本: BetterGI · 一条龙
+启动器: E:\Games\py\BetterGI\BetterGI.exe
+参数: startOneDragon
+等待模式: game
+游戏进程: YuanShen.exe, GenshinImpact.exe
+助手进程: BetterGI.exe
+超时: 15
+文档: https://www.bettergi.com/
+备注: 请在 BetterGI 设置完成后关闭游戏
+待办完成: 在 BetterGI：设置 → 一条龙 → 结束后操作 → 关闭游戏
+
+# --- 更多示例：绝区零 ---
+# 名称: 绝区零 · OneDragon · 一条龙
+# 游戏: 绝区零
+# 脚本: OneDragon · 一条龙
+# 启动器: E:\Games\py\zzz\OneDragon-Launcher.exe
+# 参数: -o --close-game
+# 等待模式: game
+# 游戏进程: ZenlessZoneZero.exe
+# 助手进程: OneDragon-Launcher.exe
+# 超时: 15
+
+# --- 更多示例：MAA（等待助手退出）---
+# 名称: 明日方舟 · MAA
+# 游戏: 明日方舟
+# 脚本: MAA · 一键长草（MuMu/ADB）
+# 启动器: D:\新建文件夹\Google\MAA-v5.16.8-win-x64\MAA.exe
+# 等待模式: helper
+# 助手进程: MAA.exe
+# 超时: 15
+
+# 待办多项可用列表行：
+# 待办完成:
+# - 第一项已完成
+# - 第二项已完成
