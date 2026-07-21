@@ -10,7 +10,9 @@ import json
 import glob
 import queue
 import threading
+import time
 import webbrowser
+import datetime
 
 # -------- 高 DPI 清晰显示（必须在创建窗口前）--------
 try:
@@ -49,6 +51,7 @@ from preset_resolver import (
 )
 import preflight
 import quick_fill as qf
+from ui_helpers import LogStore, clamp_window_bounds, elide_end, elide_middle, group_tagged_lines
 
 WAIT_MODE_LABELS = {
     "game": "等待游戏进程（助手跑完会关游戏）",
@@ -160,25 +163,39 @@ class App(tk.Tk):
 
         # 原生窗口（任务栏 / 最小化 / 最大化均正常）+ 深色标题栏
         self.minsize(940, 660)
-        self.geometry("1060x760")
-        self._center()
+        self._window_save_job = None
+        self._settings_save_job = None
+        self._restoring_window = True
+        self._restore_maximized = bool(self.settings.get("window_maximized", False))
+        self._restore_window_geometry()
         self._set_window_icon()
 
         self.plugins = []
         self.log_queue = queue.Queue()
         self.ui_queue = queue.Queue()
-        self.log_buffer = []
+        self.log_store = LogStore(max_lines=10000)
+        self.log_follow = True
+        self._log_inserting = False
+        self._log_focus_mode = False
         self.run_thread = None
         self.stop_event = threading.Event()
         self.running = False
         self._preflight_token = 0
         self._preflight_busy = False
+        self.run_state = {
+            "state": "idle", "index": 0, "total": 0,
+            "name": "", "message": "就绪", "result": None,
+        }
 
         self.current_view = None
         self.edit_target = None
         self.log_widget = None
         self.nav_items = {}
         self._cards = []
+        self._drag_from = None
+        self._drag_target = None
+        self._tooltip_win = None
+        self._tooltip_job = None
 
         self.configure(bg=self.t["bg"])
         os.makedirs(PLUGIN_DIR, exist_ok=True)
@@ -189,8 +206,17 @@ class App(tk.Tk):
         else:
             self.go("home")
         self.deiconify()
+        if self._restore_maximized:
+            try:
+                self.state("zoomed")
+            except Exception:
+                pass
+        self.bind("<Configure>", self._on_window_configure)
+        self.bind_all("<MouseWheel>", self._dispatch_mousewheel, add="+")
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(300, lambda: setattr(self, "_restoring_window", False))
         self.after(30, self._style_native_titlebar)
-        self.after(120, self._drain_log)
+        self.after(80, self._drain_log)
 
     def _set_window_icon(self):
         if os.name != "nt" or not os.path.isfile(APP_ICON_ICO):
@@ -239,6 +265,16 @@ class App(tk.Tk):
                 return None
 
     # ---------------- 窗口控制 ----------------
+    def _restore_window_geometry(self):
+        saved = self.settings.get("window_bounds")
+        if saved:
+            x, y, w, h = clamp_window_bounds(
+                saved, self.winfo_screenwidth(), self.winfo_screenheight(), 940, 660)
+            self.geometry("%dx%d+%d+%d" % (w, h, x, y))
+        else:
+            self.geometry("1060x760")
+            self._center()
+
     def _center(self):
         self.update_idletasks()
         w, h = 1060, 760
@@ -247,6 +283,46 @@ class App(tk.Tk):
         x = (sw - w) // 2
         y = (sh - h) // 2 - 20
         self.geometry("%dx%d+%d+%d" % (w, h, x, max(0, y)))
+
+    def _on_window_configure(self, event):
+        if event.widget is not self or self._restoring_window:
+            return
+        if self._window_save_job:
+            self.after_cancel(self._window_save_job)
+        self._window_save_job = self.after(500, self._save_window_state)
+
+    def _save_window_state(self):
+        self._window_save_job = None
+        try:
+            state = self.state()
+            self.settings["window_maximized"] = (state == "zoomed")
+            if state == "normal":
+                self.settings["window_bounds"] = {
+                    "x": self.winfo_x(), "y": self.winfo_y(),
+                    "width": self.winfo_width(), "height": self.winfo_height(),
+                }
+            save_settings(self.settings)
+        except Exception:
+            pass
+
+    def _schedule_settings_save(self):
+        if self._settings_save_job:
+            self.after_cancel(self._settings_save_job)
+        self._settings_save_job = self.after(350, self._flush_settings)
+
+    def _flush_settings(self):
+        self._settings_save_job = None
+        save_settings(self.settings)
+
+    def _on_close(self):
+        if self._window_save_job:
+            self.after_cancel(self._window_save_job)
+            self._window_save_job = None
+        if self._settings_save_job:
+            self.after_cancel(self._settings_save_job)
+            self._settings_save_job = None
+        self._save_window_state()
+        self.destroy()
 
     @staticmethod
     def _colorref(hexcolor):
@@ -314,6 +390,9 @@ class App(tk.Tk):
                      lightcolor=t["line"], darkcolor=t["line"], relief="flat")
         st.map("TCombobox", fieldbackground=[("readonly", t["panel"])],
                foreground=[("readonly", t["fg"])], background=[("readonly", t["panel"])])
+        st.configure("Run.Horizontal.TProgressbar", troughcolor=t["line"], background=t["accent"],
+                     bordercolor=t["line"], lightcolor=t["accent"], darkcolor=t["accent"],
+                     thickness=7)
         self.option_add("*TCombobox*Listbox.background", t["panel"])
         self.option_add("*TCombobox*Listbox.foreground", t["fg"])
         self.option_add("*TCombobox*Listbox.selectBackground", t["accent"])
@@ -361,8 +440,42 @@ class App(tk.Tk):
         self._nav("help", "使用帮助", "?", side="bottom", parent=bottom)
         self._nav("settings", "设置", "⚙", side="bottom", parent=bottom)
 
-        self.content = tk.Frame(main, bg=t["bg"])
-        self.content.pack(side="left", fill="both", expand=True)
+        body = tk.Frame(main, bg=t["bg"])
+        body.pack(side="left", fill="both", expand=True)
+        self.content = tk.Frame(body, bg=t["bg"])
+        self.content.pack(side="top", fill="both", expand=True)
+        self._build_global_run_bar(body)
+
+    def _build_global_run_bar(self, parent):
+        t = self.t
+        bar = tk.Frame(parent, bg=t["panel"], height=54,
+                       highlightthickness=1, highlightbackground=t["line"])
+        bar.pack(side="bottom", fill="x")
+        bar.pack_propagate(False)
+
+        state = tk.Frame(bar, bg=t["panel"])
+        state.pack(side="left", fill="both", expand=True, padx=(18, 10), pady=7)
+        self.global_state_dot = tk.Label(state, text="●", bg=t["panel"], fg=t["sub"], font=F(11))
+        self.global_state_dot.pack(side="left", padx=(0, 8))
+        self.global_run_title = tk.Label(state, text="串行任务未运行", bg=t["panel"], fg=t["fg"],
+                                         font=F(10, True), anchor="w")
+        self.global_run_title.pack(side="left")
+        self.global_run_detail = tk.Label(state, text=" · 准备好后可在任意页面开始", bg=t["panel"],
+                                          fg=t["sub"], font=F(9), anchor="w")
+        self.global_run_detail.pack(side="left", fill="x", expand=True, padx=(5, 0))
+
+        self.global_stop_btn = self._button(bar, "■ 停止", self.stop_run, danger=True, compact=True)
+        self.global_stop_btn.pack(side="right", padx=(6, 14), pady=10)
+        self.global_start_btn = self._button(bar, "▶ 开始运行", self.start_run, primary=True, compact=True)
+        self.global_start_btn.pack(side="right", padx=(6, 0), pady=10)
+        self.global_progress = ttk.Progressbar(bar, orient="horizontal", mode="determinate", length=96,
+                                               style="Run.Horizontal.TProgressbar")
+        self.global_progress.pack(side="right", padx=(8, 0), pady=20)
+        # 兼容旧的运行控制代码和其他页面引用。
+        self.run_btn = self.global_start_btn
+        self.stop_btn = self.global_stop_btn
+        self.status_lbl = self.global_run_detail
+        self._refresh_run_buttons()
 
     def _nav(self, key, label, icon, side="top", parent=None):
         t = self.t
@@ -398,6 +511,8 @@ class App(tk.Tk):
         if name == self.current_view and not force:
             return
         self.current_view = name
+        if name != "home":
+            self._log_focus_mode = False
         self._highlight_nav()
         for w in self.content.winfo_children():
             w.destroy()
@@ -412,124 +527,191 @@ class App(tk.Tk):
             "settings": self.build_settings,
             "help": self.build_help,
         }.get(name, self.build_home)(page)
-        self._animate_in(page)
+        self._refresh_run_buttons()
 
     def _animate_in(self, frame, step=0):
-        offsets = [44, 28, 16, 8, 3, 0]
-        if not frame.winfo_exists():
-            return
-        if step < len(offsets):
-            frame.place_configure(x=offsets[step])
-            self.after(15, lambda: self._animate_in(frame, step + 1))
+        """保留旧调用兼容；页面切换不再做位移动画，避免重绘抖动。"""
+        return
 
     # ---------------- 主页 ----------------
     def build_home(self, root):
         t = self.t
-        head = tk.Frame(root, bg=t["bg"]); head.pack(fill="x", padx=26, pady=(22, 8))
-        tk.Label(head, text="游戏列表", bg=t["bg"], fg=t["fg"], font=F(20, True)).pack(side="left")
-        self.run_btn = self._pill(head, "▶  开始运行", self.start_run, primary=True)
-        self.run_btn.pack(side="right")
-        self.stop_btn = self._pill(head, "■  停止", self.stop_run, primary=False)
-        self.stop_btn.pack(side="right", padx=(0, 10))
+        self._log_focus_mode = False
+        self.home_paned = tk.PanedWindow(
+            root, orient="vertical", bg=t["line"], bd=0, sashwidth=8,
+            sashrelief="flat", opaqueresize=True, showhandle=False,
+        )
+        self.home_paned.pack(fill="both", expand=True, padx=20, pady=(14, 14))
+        self.home_paned.bind("<ButtonRelease-1>", self._save_home_sash)
+
+        self.queue_pane = tk.Frame(self.home_paned, bg=t["bg"])
+        self.log_pane = tk.Frame(self.home_paned, bg=t["bg"])
+        self.home_paned.add(self.queue_pane, minsize=185, stretch="always")
+        self.home_paned.add(self.log_pane, minsize=190, stretch="always")
+
+        head = tk.Frame(self.queue_pane, bg=t["bg"])
+        head.pack(fill="x", padx=6, pady=(0, 8))
+        tk.Label(head, text="游戏队列", bg=t["bg"], fg=t["fg"], font=F(18, True)).pack(side="left")
+        self._button(head, "＋ 添加游戏", self.add_plugin, compact=True).pack(side="right", padx=(8, 0))
+        self._button(head, "↻ 刷新", self.reload_and_render, compact=True).pack(side="right")
 
         # ---- 顶部状态条(常驻自检汇总) ----
-        self._home_status_bar = tk.Frame(root, bg=t["panel"], highlightthickness=1,
+        self._home_status_bar = tk.Frame(self.queue_pane, bg=t["panel"], highlightthickness=1,
                                          highlightbackground=t["line"])
-        self._home_status_bar.pack(fill="x", padx=26, pady=(0, 6), ipady=4)
+        self._home_status_bar.pack(fill="x", padx=6, pady=(0, 6), ipady=3)
         self._home_status_inner = tk.Frame(self._home_status_bar, bg=t["panel"])
         self._home_status_inner.pack(fill="x", padx=12, pady=2)
         self._refresh_home_status()
 
-        tk.Label(root, text="勾选要运行的游戏，用 ▲▼ 调整顺序；Shift+滚轮可左右滚动查看长路径。",
-                 bg=t["bg"], fg=t["sub"], font=F(10), anchor="w").pack(fill="x", padx=26, pady=(0, 6))
-
-        bar = tk.Frame(root, bg=t["bg"]); bar.pack(fill="x", padx=26, pady=(0, 4))
-        self._chip(bar, "＋ 添加游戏", self.add_plugin).pack(side="left")
-        self._chip(bar, "↻ 刷新", self.reload_and_render).pack(side="left", padx=8)
-
-        wrap = tk.Frame(root, bg=t["bg"]); wrap.pack(fill="both", expand=True, padx=20, pady=(4, 4))
+        wrap = tk.Frame(self.queue_pane, bg=t["bg"])
+        wrap.pack(fill="both", expand=True, padx=2, pady=(2, 0))
         wrap.rowconfigure(0, weight=1)
         wrap.columnconfigure(0, weight=1)
         self.canvas = tk.Canvas(wrap, bg=t["bg"], highlightthickness=0)
         vsb = ttk.Scrollbar(wrap, orient="vertical", command=self.canvas.yview,
                             style="Vert.TScrollbar")
-        hsb = ttk.Scrollbar(wrap, orient="horizontal", command=self.canvas.xview,
-                            style="Horiz.TScrollbar")
-        self.canvas.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self.canvas.configure(yscrollcommand=vsb.set)
         self.canvas.grid(row=0, column=0, sticky="nsew")
         vsb.grid(row=0, column=1, sticky="ns", padx=(6, 2))
-        hsb.grid(row=1, column=0, sticky="ew", pady=(4, 0))
         self.list_frame = tk.Frame(self.canvas, bg=t["bg"])
         self.canvas.create_window((0, 0), window=self.list_frame, anchor="nw", tags="inner")
         self.list_frame.bind("<Configure>",
                              lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
         self.canvas.bind("<Configure>", self._on_list_canvas_configure)
-        self._bind_list_wheel(self.canvas)
+        self._bind_wheel(self.canvas)
         self._render_cards()
-
-        logwrap = tk.Frame(root, bg=t["bg"]); logwrap.pack(fill="both", expand=False, padx=26, pady=(6, 16))
-        lh = tk.Frame(logwrap, bg=t["bg"]); lh.pack(fill="x")
-        tk.Label(lh, text="运行日志", bg=t["bg"], fg=t["fg"], font=F(13, True)).pack(side="left")
-        self.status_lbl = tk.Label(lh, text="就绪", bg=t["bg"], fg=t["sub"], font=F(10))
-        self.status_lbl.pack(side="right")
-        self.log_widget = tk.Text(logwrap, bg=t["log_bg"], fg=t["log_fg"], insertbackground=t["fg"],
-                                  font=("Consolas", 10), relief="flat", height=9, wrap="word",
-                                  highlightthickness=1, highlightbackground=t["line"])
-        self.log_widget.tag_configure("log_err", foreground=t["err"])
-        self.log_widget.tag_configure("log_warn", foreground=t["warn"])
-        self.log_widget.pack(fill="both", expand=True, pady=(6, 0))
-        self.log_widget.configure(state="normal")
-        for line in self.log_buffer:
-            self._insert_log_line(line.rstrip("\n"))
-        self.log_widget.see("end")
-        self.log_widget.configure(state="disabled")
-        if self.running:
-            self.status_lbl.config(text="运行中…", fg=t["ok"])
+        self._build_log_panel(self.log_pane)
+        self.after_idle(self._restore_home_sash)
         self._refresh_run_buttons()
 
+    def _build_log_panel(self, parent):
+        t = self.t
+        head = tk.Frame(parent, bg=t["bg"])
+        head.pack(fill="x", padx=6, pady=(4, 6))
+        tk.Label(head, text="运行日志", bg=t["bg"], fg=t["fg"], font=F(13, True)).pack(side="left")
+        self.log_count_lbl = tk.Label(head, text="", bg=t["bg"], fg=t["sub"], font=F(9))
+        self.log_count_lbl.pack(side="left", padx=(10, 0))
+
+        self.log_focus_btn = self._button(
+            head, "□ 专注", self._toggle_log_focus, compact=True,
+        )
+        self.log_focus_btn.pack(side="right", padx=(6, 0))
+        self._button(head, "导出", self._export_log, compact=True).pack(side="right", padx=(6, 0))
+        self._button(head, "清空", self._clear_log, compact=True).pack(side="right", padx=(6, 0))
+        self._button(head, "复制", self._copy_log, compact=True).pack(side="right", padx=(6, 0))
+        self.log_follow_btn = self._button(head, "● 跟随最新", self._resume_log_follow, compact=True)
+        self.log_follow_btn.pack(side="right", padx=(6, 0))
+
+        body = tk.Frame(parent, bg=t["log_bg"], highlightthickness=1,
+                        highlightbackground=t["line"])
+        body.pack(fill="both", expand=True, padx=6, pady=(0, 2))
+        self.log_widget = tk.Text(
+            body, bg=t["log_bg"], fg=t["log_fg"], insertbackground=t["fg"],
+            selectbackground=t["accent"], selectforeground=t["on_accent"],
+            font=("Consolas", max(9, int(round(10 * _SCALE)))), relief="flat",
+            wrap="word", padx=12, pady=9, bd=0, undo=False,
+        )
+        sb = ttk.Scrollbar(body, orient="vertical", command=self._log_yview, style="Vert.TScrollbar")
+        self._log_scrollbar = sb
+        self.log_widget.configure(yscrollcommand=self._on_log_scroll)
+        sb.pack(side="right", fill="y")
+        self.log_widget.pack(side="left", fill="both", expand=True)
+        self.log_widget.tag_configure("log_err", foreground=t["err"])
+        self.log_widget.tag_configure("log_warn", foreground=t["warn"])
+        self.log_widget.tag_configure("log_ok", foreground=t["ok"])
+        self.log_widget.bind("<MouseWheel>", self._on_log_mousewheel)
+        self.log_widget.bind("<Button-4>", self._on_log_mousewheel)
+        self.log_widget.bind("<Button-5>", self._on_log_mousewheel)
+        self._render_log_store()
+
+    def _restore_home_sash(self):
+        if not hasattr(self, "home_paned") or not self.home_paned.winfo_exists():
+            return
+        self.update_idletasks()
+        total = self.home_paned.winfo_height()
+        if total <= 1:
+            return
+        ratio = self.settings.get("home_log_ratio", 0.40)
+        try:
+            ratio = min(0.72, max(0.25, float(ratio)))
+        except Exception:
+            ratio = 0.40
+        self.home_paned.sash_place(0, 0, int(total * (1.0 - ratio)))
+
+    def _save_home_sash(self, event=None):
+        if self._log_focus_mode or not hasattr(self, "home_paned"):
+            return
+        try:
+            total = self.home_paned.winfo_height()
+            sash_y = self.home_paned.sash_coord(0)[1]
+            if total > 1:
+                self.settings["home_log_ratio"] = round(1.0 - (sash_y / float(total)), 3)
+                self._schedule_settings_save()
+        except Exception:
+            pass
+
+    def _toggle_log_focus(self):
+        if not hasattr(self, "home_paned") or not self.home_paned.winfo_exists():
+            return
+        if self._log_focus_mode:
+            self.home_paned.forget(self.log_pane)
+            self.home_paned.add(self.queue_pane, minsize=185, stretch="always")
+            self.home_paned.add(self.log_pane, minsize=190, stretch="always")
+            self._log_focus_mode = False
+            self.log_focus_btn.config(text="□ 专注")
+            self.after_idle(self._restore_home_sash)
+        else:
+            self._save_home_sash()
+            self.home_paned.forget(self.queue_pane)
+            self._log_focus_mode = True
+            self.log_focus_btn.config(text="▣ 退出专注")
+        if self.log_widget and self.log_widget.winfo_exists():
+            self.log_widget.focus_set()
+
     def _bind_wheel(self, canvas):
-        def on_wheel(e):
-            if canvas.winfo_exists():
-                canvas.yview_scroll(int(-e.delta / 120), "units")
-        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", on_wheel))
-        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+        canvas._wheel_scrollable = True
 
     def _bind_list_wheel(self, canvas):
-        def on_ywheel(e):
-            if canvas.winfo_exists():
-                canvas.yview_scroll(int(-e.delta / 120), "units")
+        self._bind_wheel(canvas)
 
-        def on_xwheel(e):
-            if canvas.winfo_exists():
-                canvas.xview_scroll(int(-e.delta / 120), "units")
-
-        def bind_all():
-            canvas.bind_all("<MouseWheel>", on_ywheel)
-            canvas.bind_all("<Shift-MouseWheel>", on_xwheel)
-
-        def unbind_all():
-            canvas.unbind_all("<MouseWheel>")
-            canvas.unbind_all("<Shift-MouseWheel>")
-
-        canvas.bind("<Enter>", lambda e: bind_all())
-        canvas.bind("<Leave>", lambda e: unbind_all())
+    def _dispatch_mousewheel(self, event):
+        widget = event.widget
+        while widget is not None:
+            if widget is getattr(self, "log_widget", None):
+                return
+            if isinstance(widget, tk.Text):
+                return
+            if isinstance(widget, tk.Canvas) and getattr(widget, "_wheel_scrollable", False):
+                delta = -1 if event.delta > 0 else 1
+                widget.yview_scroll(delta * 3, "units")
+                return "break"
+            try:
+                widget = widget.master
+            except Exception:
+                break
 
     def _on_list_canvas_configure(self, event=None):
         if not hasattr(self, "canvas") or not self.canvas.winfo_exists():
             return
         cw = self.canvas.winfo_width()
-        req = self.list_frame.winfo_reqwidth()
-        self.canvas.itemconfig("inner", width=max(cw, req))
+        self.canvas.itemconfig("inner", width=cw)
         self._sync_card_wraplength()
 
     def _sync_card_wraplength(self):
         if not hasattr(self, "canvas") or not self.canvas.winfo_exists():
             return
-        available = max(160, self.canvas.winfo_width() - 320)
+        max_chars = max(22, int((self.canvas.winfo_width() - 420) / 7))
+        name_chars = max(8, int((self.canvas.winfo_width() - 430) / 20))
         for refs in getattr(self, "_cards", []):
-            for lbl in refs.get("wrap_labels", []):
-                if lbl.winfo_exists():
-                    lbl.config(wraplength=available)
+            name_lbl = refs.get("name")
+            if name_lbl and name_lbl.winfo_exists():
+                name_lbl.config(text="%02d  %s" % (
+                    refs.get("index", 0) + 1,
+                    elide_end(refs.get("full_name") or "未命名", name_chars),
+                ))
+            path_lbl = refs.get("path")
+            if path_lbl and path_lbl.winfo_exists():
+                path_lbl.config(text=elide_middle(refs.get("full_path") or "（未设置）", max_chars))
 
     def _render_cards(self):
         for w in self.list_frame.winfo_children():
@@ -616,66 +798,141 @@ class App(tk.Tk):
         enabled = bool(p.get("enabled", True))
         panel = t["panel"]
         card = tk.Frame(self.list_frame, bg=panel, highlightthickness=1, highlightbackground=t["line"])
-        card.pack(fill="x", pady=6, padx=4)
-        strip = tk.Frame(card, bg=(t["accent"] if enabled else t["line"]), width=6)
+        card.pack(fill="x", pady=3, padx=4)
+        strip = tk.Frame(card, bg=(t["accent"] if enabled else t["line"]), width=4)
         strip.pack(side="left", fill="y")
         inner = tk.Frame(card, bg=panel)
-        inner.pack(side="left", fill="both", expand=True, padx=14, pady=12)
+        inner.pack(side="left", fill="both", expand=True, padx=10, pady=7)
+        inner.columnconfigure(0, weight=0, minsize=28)
+        inner.columnconfigure(1, weight=0, minsize=42)
         inner.columnconfigure(2, weight=1, minsize=120)
-        inner.columnconfigure(3, weight=0, minsize=196)
+        inner.columnconfigure(3, weight=0, minsize=190)
 
-        sw = tk.Label(inner, text=("开" if enabled else "关"),
-                      bg=(t["accent"] if enabled else t["line"]),
-                      fg=(t["on_accent"] if enabled else t["sub"]),
-                      font=F(11, True), width=4, pady=4, cursor="hand2")
-        sw.grid(row=0, column=0, rowspan=4, padx=(0, 8), sticky="ns")
-        sw.bind("<Button-1>", lambda e, pl=p: self.toggle(pl))
+        handle = tk.Label(inner, text="≡", bg=panel, fg=t["sub"], font=F(15),
+                          width=2, cursor="fleur")
+        handle.grid(row=0, column=0, rowspan=3, padx=(0, 4), sticky="ns")
+        handle.bind("<ButtonPress-1>", lambda e, i=idx: self._start_card_drag(i))
+        handle.bind("<B1-Motion>", self._move_card_drag)
+        handle.bind("<ButtonRelease-1>", self._finish_card_drag)
 
-        tk.Label(inner, text="%02d" % (idx + 1), bg=panel, fg=t["accent"],
-                 font=("Consolas", 16, "bold"), width=3).grid(row=0, column=1, rowspan=4, padx=(0, 8), sticky="n")
+        sw = self._button(inner, ("开" if enabled else "关"), lambda pl=p: self.toggle(pl),
+                          primary=enabled, compact=True, width=3)
+        if not enabled:
+            sw.config(bg=t["line"], fg=t["sub"])
+            sw._base = t["line"]
+        sw.grid(row=0, column=1, rowspan=3, padx=(0, 8), sticky="ns")
 
         mid = tk.Frame(inner, bg=panel)
         mid.grid(row=0, column=2, sticky="nsew", padx=(0, 10))
+        mid.columnconfigure(1, weight=1)
 
-        wrap_labels = []
-        name_lbl = tk.Label(mid, text=p.get("name", "未命名"), bg=panel,
+        full_name = p.get("name", "未命名")
+        name_lbl = tk.Label(mid, text="%02d  %s" % (idx + 1, full_name), bg=panel,
                             fg=(t["fg"] if enabled else t["sub"]), font=F(13, True),
                             anchor="w", justify="left")
-        name_lbl.pack(anchor="w", fill="x")
-        wrap_labels.append(name_lbl)
+        name_lbl.grid(row=0, column=0, columnspan=2, sticky="ew")
+        self._attach_tooltip(name_lbl, full_name)
 
         launcher = p.get("launcher", "")
         ok = bool(launcher) and os.path.exists(launcher)
-        st_lbl = tk.Label(mid, text=("✓ 路径有效" if ok else "✗ 找不到启动器，请点『编辑』设置路径"),
-                          bg=panel, fg=(t["ok"] if ok else t["err"]), font=F(9),
-                          anchor="w", justify="left")
-        st_lbl.pack(anchor="w", fill="x")
-        wrap_labels.append(st_lbl)
+        pending = pc.pending_checklist_count(p)
+        status_text = "✓ 就绪" if ok else "✗ 路径无效"
+        if pending:
+            status_text += "  ·  ⚠ %d 项待办" % pending
+        st_lbl = tk.Label(mid, text=status_text, bg=panel,
+                          fg=(t["err"] if not ok else (t["warn"] if pending else t["ok"])),
+                          font=F(9), anchor="w", justify="left")
+        st_lbl.grid(row=1, column=0, sticky="w", padx=(0, 10))
 
         path_lbl = tk.Label(mid, text=(launcher or "（未设置）"), bg=panel, fg=t["sub"],
                             font=F(9), anchor="w", justify="left")
-        path_lbl.pack(anchor="w", fill="x")
-        wrap_labels.append(path_lbl)
-
-        pending = pc.pending_checklist_count(p)
-        if pending:
-            warn_lbl = tk.Label(mid, text="⚠ %d 项脚本侧设置待确认，可能影响运行（点编辑查看）" % pending,
-                                bg=panel, fg=t["warn"], font=F(9), anchor="w", justify="left")
-            warn_lbl.pack(anchor="w", fill="x")
-            wrap_labels.append(warn_lbl)
+        path_lbl.grid(row=1, column=1, sticky="ew")
+        self._attach_tooltip(path_lbl, launcher or "尚未设置启动器路径")
 
         right = tk.Frame(inner, bg=panel)
-        right.grid(row=0, column=3, rowspan=4, sticky="ne")
-        self._icon_btn(right, "▲", lambda: self.move(idx, -1)).pack(side="left", padx=2)
-        self._icon_btn(right, "▼", lambda: self.move(idx, +1)).pack(side="left", padx=2)
-        self._chip(right, "编辑", lambda: self.open_edit(p)).pack(side="left", padx=(8, 2))
-        self._chip(right, "删除", lambda: self.delete_plugin(p)).pack(side="left", padx=2)
+        right.grid(row=0, column=3, rowspan=3, sticky="e")
+        up = self._icon_btn(right, "▲", lambda: self.move(idx, -1)); up.pack(side="left", padx=2)
+        down = self._icon_btn(right, "▼", lambda: self.move(idx, +1)); down.pack(side="left", padx=2)
+        edit = self._button(right, "编辑", lambda: self.open_edit(p), compact=True)
+        edit.pack(side="left", padx=(8, 2))
+        delete = self._icon_btn(right, "×", lambda: self.delete_plugin(p)); delete.pack(side="left", padx=2)
 
         self._cards.append({
             "plugin": p, "strip": strip, "switch": sw, "name": name_lbl,
-            "wrap_labels": wrap_labels,
+            "index": idx, "full_name": full_name,
+            "path": path_lbl, "full_path": launcher,
+            "card": card, "handle": handle, "controls": [sw, up, down, edit, delete],
         })
         self.after_idle(self._sync_card_wraplength)
+        self._refresh_card_controls()
+
+    def _start_card_drag(self, idx):
+        if self.running or self._preflight_busy:
+            return
+        self._drag_from = idx
+        self._drag_target = idx
+
+    def _move_card_drag(self, event):
+        if self._drag_from is None:
+            return
+        y = event.y_root
+        target = self._drag_from
+        for i, refs in enumerate(self._cards):
+            card = refs["card"]
+            if card.winfo_rooty() <= y <= card.winfo_rooty() + card.winfo_height():
+                target = i
+                break
+        self._drag_target = target
+        for i, refs in enumerate(self._cards):
+            refs["card"].config(highlightbackground=(
+                self.t["accent"] if i == target else self.t["line"]))
+
+    def _finish_card_drag(self, event=None):
+        source, target = self._drag_from, self._drag_target
+        self._drag_from = None
+        self._drag_target = None
+        for refs in self._cards:
+            refs["card"].config(highlightbackground=self.t["line"])
+        if source is None or target is None or source == target:
+            return
+        item = self.plugins.pop(source)
+        self.plugins.insert(target, item)
+        for order, plugin in enumerate(self.plugins, 1):
+            plugin["order"] = order
+            save_plugin(plugin)
+        self._render_cards()
+
+    def _attach_tooltip(self, widget, text):
+        widget.bind("<Enter>", lambda e, w=widget, s=text: self._schedule_tooltip(w, s), add="+")
+        widget.bind("<Leave>", lambda e: self._hide_tooltip(), add="+")
+
+    def _schedule_tooltip(self, widget, text):
+        self._hide_tooltip()
+        self._tooltip_job = self.after(450, lambda: self._show_tooltip(widget, text))
+
+    def _show_tooltip(self, widget, text):
+        self._tooltip_job = None
+        if not text or not widget.winfo_exists():
+            return
+        win = tk.Toplevel(self)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(bg=self.t["line"])
+        tk.Label(win, text=text, bg=self.t["panel"], fg=self.t["fg"], font=F(9),
+                 padx=9, pady=6, justify="left", wraplength=620).pack(padx=1, pady=1)
+        win.geometry("+%d+%d" % (widget.winfo_rootx(), widget.winfo_rooty() + widget.winfo_height() + 4))
+        self._tooltip_win = win
+
+    def _hide_tooltip(self):
+        if self._tooltip_job:
+            self.after_cancel(self._tooltip_job)
+            self._tooltip_job = None
+        if self._tooltip_win:
+            try:
+                self._tooltip_win.destroy()
+            except Exception:
+                pass
+            self._tooltip_win = None
 
     # ---------------- 编辑 ----------------
     def open_edit(self, p):
@@ -1197,32 +1454,35 @@ class App(tk.Tk):
         box.configure(state="disabled")
 
     # ---------------- 通用控件 ----------------
-    def _pill(self, parent, text, cmd, primary=True):
+    def _button(self, parent, text, cmd, primary=False, danger=False, compact=False, width=None):
         t = self.t
-        bgc = t["accent"] if primary else t["panel"]
-        fgc = t["on_accent"] if primary else t["fg"]
-        b = tk.Label(parent, text=text, bg=bgc, fg=fgc, font=F(12, True), padx=20, pady=9, cursor="hand2")
-        b._base = bgc
-        b.bind("<Button-1>", lambda e: cmd())
-        b.bind("<Enter>", lambda e: b.config(bg=t["fg"] if primary else t["line"]))
-        b.bind("<Leave>", lambda e: b.config(bg=b._base))
-        return b
+        bg = t["err"] if danger else (t["accent"] if primary else t["panel"])
+        fg = "#ffffff" if danger else (t["on_accent"] if primary else t["fg"])
+        button = tk.Button(
+            parent, text=text, command=cmd, bg=bg, fg=fg,
+            activebackground=(t["err"] if danger else (t["fg"] if primary else t["line"])),
+            activeforeground=("#ffffff" if danger else (t["on_accent"] if primary else t["fg"])),
+            disabledforeground=t["sub"], font=F(9 if compact else 11, primary or danger),
+            relief="flat", bd=0, cursor="hand2", padx=(9 if compact else 16),
+            pady=(4 if compact else 8), takefocus=True,
+            highlightthickness=1, highlightbackground=t["line"], highlightcolor=t["accent"],
+        )
+        if width is not None:
+            button.config(width=width)
+        button._base = bg
+        return button
+
+    def _pill(self, parent, text, cmd, primary=True):
+        return self._button(parent, text, cmd, primary=primary)
 
     def _chip(self, parent, text, cmd):
-        t = self.t
-        b = tk.Label(parent, text=text, bg=t["panel"], fg=t["fg"], font=F(10), padx=12, pady=6,
-                     cursor="hand2", highlightthickness=1, highlightbackground=t["line"])
-        b.bind("<Button-1>", lambda e: cmd())
-        b.bind("<Enter>", lambda e: b.config(fg=t["accent"]))
-        b.bind("<Leave>", lambda e: b.config(fg=t["fg"]))
-        return b
+        return self._button(parent, text, cmd, compact=True)
 
     def _icon_btn(self, parent, text, cmd):
         t = self.t
-        b = tk.Label(parent, text=text, bg=t["line"], fg=t["fg"], font=F(11), width=3, pady=4, cursor="hand2")
-        b.bind("<Button-1>", lambda e: cmd())
-        b.bind("<Enter>", lambda e: b.config(bg=t["accent"], fg=t["on_accent"]))
-        b.bind("<Leave>", lambda e: b.config(bg=t["line"], fg=t["fg"]))
+        b = self._button(parent, text, cmd, compact=True, width=2)
+        b.config(bg=t["line"], fg=t["fg"], padx=2)
+        b._base = t["line"]
         return b
 
     # ---------------- 数据 ----------------
@@ -1239,6 +1499,8 @@ class App(tk.Tk):
             self._render_cards()
 
     def toggle(self, p):
+        if self.running or self._preflight_busy:
+            return
         # 就地刷新，不重建整个列表
         p["enabled"] = not bool(p.get("enabled", True))
         save_plugin(p)
@@ -1250,11 +1512,14 @@ class App(tk.Tk):
                 refs["switch"].config(text=("开" if en else "关"),
                                       bg=(t["accent"] if en else t["line"]),
                                       fg=(t["on_accent"] if en else t["sub"]))
+                refs["switch"]._base = t["accent"] if en else t["line"]
                 refs["name"].config(fg=t["fg"] if en else t["sub"])
                 break
         self._refresh_home_status()
 
     def move(self, idx, delta):
+        if self.running or self._preflight_busy:
+            return
         j = idx + delta
         if j < 0 or j >= len(self.plugins):
             return
@@ -1265,6 +1530,8 @@ class App(tk.Tk):
         self._render_cards()
 
     def delete_plugin(self, p):
+        if self.running or self._preflight_busy:
+            return
         if not messagebox.askyesno("确认删除",
                                    "确定删除「%s」吗？\n（只删本助手里的配置，不影响游戏或脚本本体）"
                                    % p.get("name")):
@@ -1277,6 +1544,8 @@ class App(tk.Tk):
         self._render_cards()
 
     def add_plugin(self):
+        if self.running or self._preflight_busy:
+            return
         self.go("add", force=True)
 
     # ---------------- 添加向导 ----------------
@@ -1864,15 +2133,60 @@ class App(tk.Tk):
 
     # ---------------- 运行 ----------------
     def _refresh_run_buttons(self):
-        if not hasattr(self, "run_btn") or not self.run_btn.winfo_exists():
+        if not hasattr(self, "global_start_btn") or not self.global_start_btn.winfo_exists():
             return
         t = self.t
-        if self.running:
-            self.run_btn.config(bg=t["line"], fg=t["sub"]); self.run_btn._base = t["line"]
-            self.stop_btn.config(bg=t["err"], fg="#ffffff"); self.stop_btn._base = t["err"]
+        busy = self.running or self._preflight_busy
+        can_start_here = self.current_view not in ("add", "edit", "first_run")
+        self.global_start_btn.config(state=("normal" if not busy and can_start_here else "disabled"))
+        can_stop = self.running and self.run_state.get("state") != "stopping"
+        self.global_stop_btn.config(state=("normal" if can_stop else "disabled"))
+        if busy:
+            self.global_start_btn.config(bg=t["line"], fg=t["sub"])
+            self.global_start_btn._base = t["line"]
         else:
-            self.run_btn.config(bg=t["accent"], fg=t["on_accent"]); self.run_btn._base = t["accent"]
-            self.stop_btn.config(bg=t["panel"], fg=t["fg"]); self.stop_btn._base = t["panel"]
+            self.global_start_btn.config(bg=t["accent"], fg=t["on_accent"])
+            self.global_start_btn._base = t["accent"]
+        self.global_stop_btn.config(bg=(t["err"] if self.running else t["panel"]),
+                                    fg=("#ffffff" if self.running else t["sub"]))
+        self.global_stop_btn._base = t["err"] if self.running else t["panel"]
+        self._refresh_card_controls()
+        self._update_global_run_bar()
+
+    def _refresh_card_controls(self):
+        state = "disabled" if (self.running or self._preflight_busy) else "normal"
+        for refs in getattr(self, "_cards", []):
+            for control in refs.get("controls", []):
+                if control.winfo_exists():
+                    control.config(state=state)
+            handle = refs.get("handle")
+            if handle and handle.winfo_exists():
+                handle.config(cursor=("arrow" if state == "disabled" else "fleur"),
+                              fg=(self.t["line"] if state == "disabled" else self.t["sub"]))
+
+    def _update_global_run_bar(self):
+        if not hasattr(self, "global_run_title") or not self.global_run_title.winfo_exists():
+            return
+        t = self.t
+        state = self.run_state.get("state", "idle")
+        index = int(self.run_state.get("index", 0) or 0)
+        total = int(self.run_state.get("total", 0) or 0)
+        name = self.run_state.get("name", "")
+        message = self.run_state.get("message", "") or "就绪"
+        if self._preflight_busy:
+            title, detail, color = "正在运行前检查", "检查路径、权限和进程占用…", t["accent"]
+        elif state in ("running", "stopping"):
+            title = ("%d/%d  %s" % (index, total, name)) if total else (name or "串行任务运行中")
+            detail = message
+            color = t["warn"] if state == "stopping" else t["ok"]
+        elif state == "finished":
+            title, detail, color = "本轮串行任务已结束", message, t["sub"]
+        else:
+            title, detail, color = "串行任务未运行", "准备好后可在任意页面开始", t["sub"]
+        self.global_run_title.config(text=title)
+        self.global_run_detail.config(text=" · " + detail)
+        self.global_state_dot.config(fg=color)
+        self.global_progress.config(maximum=max(1, total), value=min(total, index))
 
     def start_run(self):
         if self.running or self._preflight_busy:
@@ -1895,13 +2209,7 @@ class App(tk.Tk):
 
     def _set_preflight_busy(self, busy):
         self._preflight_busy = busy
-        if hasattr(self, "status_lbl") and self.status_lbl.winfo_exists():
-            if busy:
-                self.status_lbl.config(text="正在检查…", fg=self.t["sub"])
-            elif not self.running:
-                self.status_lbl.config(text="就绪", fg=self.t["sub"])
-        if hasattr(self, "run_btn") and self.run_btn.winfo_exists():
-            self.run_btn.config(state=("disabled" if busy else "normal"))
+        self._refresh_run_buttons()
         if busy:
             self.update_idletasks()
 
@@ -1926,19 +2234,17 @@ class App(tk.Tk):
                                        parent=self):
                 return
 
-        self.log_buffer = []
-        if self.log_widget and self.log_widget.winfo_exists():
-            self.log_widget.configure(state="normal")
-            self.log_widget.delete("1.0", "end")
-            self.log_widget.configure(state="disabled")
+        self._clear_log(confirm=False)
         self.stop_event.clear()
         self.running = True
+        self.run_state = {
+            "state": "running", "index": 0, "total": len(active),
+            "name": "", "message": "正在启动串行任务", "result": None,
+        }
         self._refresh_run_buttons()
-        if hasattr(self, "status_lbl") and self.status_lbl.winfo_exists():
-            self.status_lbl.config(text="运行中…", fg=self.t["ok"])
 
         def worker():
-            runner = runner_core.Runner(self._enqueue_log, self.stop_event)
+            runner = runner_core.Runner(self._enqueue_log, self.stop_event, self._enqueue_run_event)
             try:
                 runner.run_all(active)
             except Exception as e:
@@ -1949,61 +2255,206 @@ class App(tk.Tk):
         self.run_thread.start()
 
     def stop_run(self):
-        if not self.running:
+        if not self.running or self.run_state.get("state") == "stopping":
             return
         self.stop_event.set()
-        if hasattr(self, "status_lbl") and self.status_lbl.winfo_exists():
-            self.status_lbl.config(text="正在停止…", fg=self.t["warn"])
+        self.run_state["state"] = "stopping"
+        self.run_state["message"] = "正在结束当前等待…"
+        self._refresh_run_buttons()
         self._enqueue_log("已请求停止，正在结束当前等待…")
 
     def _enqueue_log(self, msg):
         self.log_queue.put(("line", msg))
+
+    def _enqueue_run_event(self, event):
+        self.ui_queue.put(("run_event", event))
+
+    def _apply_run_event(self, event):
+        kind = event.get("type")
+        active_state = "stopping" if self.stop_event.is_set() else "running"
+        if kind == "queue_started":
+            self.run_state.update(state=active_state, total=event.get("total", 0),
+                                  index=0, message="串行队列已开始")
+        elif kind == "task_started":
+            self.run_state.update(state=active_state, index=event.get("index", 0),
+                                  total=event.get("total", 0), name=event.get("name", ""),
+                                  message="正在检查配置")
+        elif kind == "stage_changed":
+            self.run_state.update(state=active_state, index=event.get("index", 0),
+                                  total=event.get("total", 0), name=event.get("name", ""),
+                                  message=event.get("message", "运行中"))
+        elif kind == "task_finished":
+            labels = {"completed": "已完成", "skipped": "已跳过", "failed": "启动失败", "stopped": "已停止"}
+            self.run_state.update(index=event.get("index", 0), total=event.get("total", 0),
+                                  name=event.get("name", ""),
+                                  message=labels.get(event.get("result"), "已结束"))
+        elif kind == "queue_finished":
+            result = event.get("result", "completed")
+            self.run_state.update(state="finished", result=result,
+                                  message=("用户已停止本轮任务" if result == "stopped" else "全部任务执行完成"))
+        self._update_global_run_bar()
 
     def _log_tag_for(self, msg):
         if any(k in msg for k in ("[跳过]", "[失败]", "未找到启动器", "未配置启动器", "配置不完整")):
             return "log_err"
         if "[警告]" in msg:
             return "log_warn"
+        if any(k in msg for k in ("[完成]", "全部任务执行完成")):
+            return "log_ok"
         return None
 
-    def _insert_log_line(self, msg):
+    def _render_log_store(self):
         if not self.log_widget or not self.log_widget.winfo_exists():
             return
-        tag = self._log_tag_for(msg)
-        start = self.log_widget.index("end-1c")
-        self.log_widget.insert("end", msg + "\n")
-        if tag:
-            self.log_widget.tag_add(tag, start, "end-1c")
-        self.log_widget.see("end")
+        self._log_inserting = True
+        self.log_widget.config(state="normal")
+        self.log_widget.delete("1.0", "end")
+        for tag, payload in group_tagged_lines(self.log_store.lines, self._log_tag_for):
+            self.log_widget.insert("end", payload, tag or ())
+        self.log_widget.config(state="disabled")
+        if self.log_follow:
+            self.log_widget.see("end")
+        self.after_idle(self._finish_log_insert)
+        self._update_log_toolbar()
+
+    def _insert_log_batch(self, lines, overflow=0):
+        if not lines or not self.log_widget or not self.log_widget.winfo_exists():
+            self._update_log_toolbar()
+            return
+        self._log_inserting = True
+        self.log_widget.config(state="normal")
+        if overflow:
+            self.log_widget.delete("1.0", "%d.0" % (overflow + 1))
+        for tag, payload in group_tagged_lines(lines, self._log_tag_for):
+            self.log_widget.insert("end", payload, tag or ())
+        self.log_widget.config(state="disabled")
+        if self.log_follow:
+            self.log_widget.see("end")
+        self.after_idle(self._finish_log_insert)
+        self._update_log_toolbar()
+
+    def _finish_log_insert(self):
+        self._log_inserting = False
+
+    def _log_yview(self, *args):
+        if self.log_widget and self.log_widget.winfo_exists():
+            self.log_widget.yview(*args)
+            self._sync_log_follow_from_view()
+
+    def _on_log_scroll(self, first, last):
+        if hasattr(self, "_log_scrollbar") and self._log_scrollbar.winfo_exists():
+            self._log_scrollbar.set(first, last)
+        if not self._log_inserting:
+            at_bottom = float(last) >= 0.999
+            if self.log_follow != at_bottom:
+                self.log_follow = at_bottom
+                self._update_log_toolbar()
+
+    def _on_log_mousewheel(self, event):
+        self.log_follow = False
+        self.after_idle(self._sync_log_follow_from_view)
+
+    def _sync_log_follow_from_view(self):
+        if self.log_widget and self.log_widget.winfo_exists():
+            self.log_follow = self.log_widget.yview()[1] >= 0.999
+            self._update_log_toolbar()
+
+    def _resume_log_follow(self):
+        self.log_follow = True
+        if self.log_widget and self.log_widget.winfo_exists():
+            self.log_widget.see("end")
+        self._update_log_toolbar()
+
+    def _update_log_toolbar(self):
+        if hasattr(self, "log_follow_btn") and self.log_follow_btn.winfo_exists():
+            self.log_follow_btn.config(
+                text=("● 跟随最新" if self.log_follow else "○ 已暂停 · 跟随最新"),
+                fg=(self.t["ok"] if self.log_follow else self.t["warn"]),
+            )
+        if hasattr(self, "log_count_lbl") and self.log_count_lbl.winfo_exists():
+            dropped = self.log_store.dropped_total
+            suffix = (" · 已丢弃较早 %d 行" % dropped) if dropped else ""
+            self.log_count_lbl.config(text="%d 行%s" % (len(self.log_store.lines), suffix))
+
+    def _copy_log(self):
+        text = ""
+        if self.log_widget and self.log_widget.winfo_exists():
+            try:
+                text = self.log_widget.get("sel.first", "sel.last")
+            except tk.TclError:
+                text = self.log_store.export_text()
+        if not text:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(text)
+
+    def _clear_log(self, confirm=True):
+        if confirm and self.log_store.lines:
+            if not messagebox.askyesno("清空日志", "确定清空当前运行日志吗？", parent=self):
+                return
+        self.log_store.clear()
+        self.log_follow = True
+        if self.log_widget and self.log_widget.winfo_exists():
+            self._render_log_store()
+
+    def _export_log(self):
+        if not self.log_store.lines:
+            messagebox.showinfo("导出日志", "当前没有可以导出的日志。", parent=self)
+            return
+        default_name = "运行日志_%s.txt" % datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = filedialog.asksaveasfilename(
+            title="导出运行日志", parent=self, defaultextension=".txt",
+            initialfile=default_name, filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8-sig", newline="\n") as f:
+                f.write(self.log_store.export_text())
+            messagebox.showinfo("导出完成", "日志已保存到：\n%s" % path, parent=self)
+        except Exception as e:
+            messagebox.showerror("导出失败", str(e), parent=self)
 
     def _drain_log(self):
+        start = time.perf_counter()
         try:
-            while True:
+            for _ in range(100):
                 item = self.ui_queue.get_nowait()
                 kind = item[0]
                 if kind == "preflight":
                     self._finish_preflight(item[1], item[2], item[3])
                 elif kind == "scan":
                     self._apply_scan_result(item[1], item[2], item[3])
+                elif kind == "run_event":
+                    self._apply_run_event(item[1])
+                if (time.perf_counter() - start) >= 0.012:
+                    break
         except queue.Empty:
             pass
+
+        lines = []
+        done = False
         try:
-            while True:
+            while len(lines) < 500 and (time.perf_counter() - start) < 0.016:
                 kind, msg = self.log_queue.get_nowait()
                 if kind == "__DONE__":
-                    self.running = False
-                    self._refresh_run_buttons()
-                    if hasattr(self, "status_lbl") and self.status_lbl.winfo_exists():
-                        self.status_lbl.config(text="已结束", fg=self.t["sub"])
+                    done = True
                 else:
-                    self.log_buffer.append(msg + "\n")
-                    if self.log_widget and self.log_widget.winfo_exists():
-                        self.log_widget.configure(state="normal")
-                        self._insert_log_line(msg)
-                        self.log_widget.configure(state="disabled")
+                    lines.append(str(msg).rstrip("\r\n"))
         except queue.Empty:
             pass
-        interval = 30 if self._preflight_busy else 120
+
+        if lines:
+            overflow = self.log_store.append_many(lines)
+            self._insert_log_batch(lines, overflow)
+        if done:
+            self.running = False
+            if self.run_state.get("state") not in ("finished",):
+                self.run_state.update(state="finished", message="本轮任务已结束")
+            self._refresh_run_buttons()
+
+        pending = not self.log_queue.empty() or not self.ui_queue.empty()
+        interval = 16 if pending else (30 if self._preflight_busy else 80)
         self.after(interval, self._drain_log)
 
 
@@ -2026,8 +2477,14 @@ HELP_TEXT = """欢迎使用「游戏串行一键长草助手」
 
 三步上手
   1) 在「主页」点每行左侧的 开/关，决定要不要跑。
-  2) 用每行的 ▲ ▼ 调整运行先后顺序。
-  3) 点右上角「▶ 开始运行」，剩下交给电脑。
+  2) 拖动每行左侧「≡」，或用 ▲ ▼ 调整运行先后顺序。
+  3) 点底部「▶ 开始运行」，剩下交给电脑。
+
+运行日志
+  • 拖动游戏队列与日志之间的分隔条，可自由调整日志高度。
+  • 点「专注」让日志铺满右侧内容区；再次点击返回。
+  • 向上滚动会暂停自动跟随，点「跟随最新」即可恢复。
+  • 支持复制、清空和导出；界面最多保留最近 10000 行。
 
 添加游戏（推荐）
   点「＋ 添加游戏」→ 选游戏与脚本 → 路径自动探测 → 勾选脚本侧待办 → 保存。
@@ -2094,7 +2551,8 @@ HELP_TEXT = """欢迎使用「游戏串行一键长草助手」
   • 建议双击「一键长草助手.exe」以管理员身份打开（首次会 UAC 提示），部分脚本需要管理员权限。
   • 运行中可随时点「■ 停止」；切换页面不会中断运行。
   • 编辑页可展开「高级选项」手动改进程名与启动参数。
-  • 主页支持 Shift+滚轮横向滚动；粘贴填充见「粘贴填充」弹窗内样例。
+  • 长路径会自动省略，鼠标停在路径或游戏名上可查看完整内容。
+  • 粘贴填充见「粘贴填充」弹窗内样例。
 """
 
 

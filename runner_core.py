@@ -149,9 +149,25 @@ def build_pre_cmd(pre, pre_args, method="explorer"):
 
 
 class Runner:
-    def __init__(self, log_func, stop_event=None):
+    def __init__(self, log_func, stop_event=None, event_func=None):
         self.log = log_func
         self.stop_event = stop_event
+        self.event_func = event_func
+
+    def _emit(self, event_type, **payload):
+        """发送结构化运行事件；界面回调失败不能打断串行任务。"""
+        if not self.event_func:
+            return
+        event = {"type": event_type}
+        event.update(payload)
+        try:
+            self.event_func(event)
+        except Exception:
+            pass
+
+    def _stage(self, stage, message, **payload):
+        payload.update({"stage": stage, "message": message})
+        self._emit("stage_changed", **payload)
 
     def _stopped(self):
         return self.stop_event is not None and self.stop_event.is_set()
@@ -179,72 +195,96 @@ class Runner:
 
     def run_all(self, plugins):
         """plugins：已按 order 排序、且只含 enabled 的插件 dict 列表。"""
-        self._tlog("开始串行执行，共 %d 个游戏。" % len(plugins))
+        total = len(plugins)
+        self._emit("queue_started", total=total)
+        self._tlog("开始串行执行，共 %d 个游戏。" % total)
         self.log("")
         for idx, p in enumerate(plugins, 1):
             if self._stopped():
                 self._tlog("已被用户中止。")
+                self._emit("queue_finished", result="stopped", total=total)
                 return
-            self._run_one(idx, len(plugins), p)
+            name = p.get("name", p.get("id", "未知"))
+            self._emit("task_started", index=idx, total=total, name=name)
+            result = self._run_one(idx, total, p)
+            self._emit("task_finished", index=idx, total=total, name=name, result=result)
             self.log("")
+            if result == "stopped":
+                self._tlog("已被用户中止。")
+                self._emit("queue_finished", result="stopped", total=total)
+                return
         self._tlog("全部任务执行完成。")
+        self._emit("queue_finished", result="completed", total=total)
 
     def _run_one(self, idx, total, p):
         name = p.get("name", p.get("id", "未知"))
         self._tlog("========== (%d/%d) %s ==========" % (idx, total, name))
+        event_base = {"index": idx, "total": total, "name": name}
+        self._stage("checking", "正在检查配置", **event_base)
 
         skip = plugin_skip_reason(p)
         if skip:
             self._tlog("[跳过] %s — %s" % (name, skip))
-            return
+            return "skipped"
 
         self._log_checklist_warnings(p)
 
         pre = (p.get("pre_launcher") or "").strip().strip('"')
         if pre:
+            self._stage("preparing", "正在启动前置程序", **event_base)
             self._run_pre_launch(p, pre)
             if self._stopped():
-                return
+                return "stopped"
 
         launcher = p.get("launcher", "").strip().strip('"')
         args = p.get("args", [])
         cmd = [launcher] + list(args)
         workdir = os.path.dirname(launcher)
         try:
+            self._stage("launching", "正在启动脚本", **event_base)
             subprocess.Popen(cmd, cwd=workdir)
             self._tlog("[启动] %s %s" % (os.path.basename(launcher), " ".join(args)))
         except Exception as e:
             self._tlog("[失败] 启动出错：%s" % e)
-            return
+            return "failed"
 
         wait_mode = p.get("wait_mode", "game")
         helper_procs = p.get("helper_processes", [])
 
         if wait_mode == "helper":
             # 等助手自己退出
+            self._stage("waiting", "等待助手运行完成", **event_base)
             self._tlog("[等待] 等待助手运行完成并自动退出...")
             self._wait_until_all_gone(helper_procs)
+            stopped = self._stopped()
             # 收尾：脚本没帮忙关游戏时兜底关闭
             for gp in p.get("game_processes", []):
                 if _tasklist_running(gp):
                     _kill(gp, self._tlog, label="游戏")
-            self._tlog("[完成] %s" % name)
-            return
+            if not stopped:
+                self._tlog("[完成] %s" % name)
+            return "stopped" if stopped else "completed"
 
         # wait_mode == "game"
         game_procs = p.get("game_processes", [])
         timeout_min = int(p.get("start_timeout_min", 15))
+        self._stage("waiting_start", "等待游戏启动", **event_base)
         self._tlog("[等待] 游戏启动中（最多 %d 分钟）..." % timeout_min)
         appeared = self._wait_until_any_appear(game_procs, timeout_min)
-        if not appeared:
+        stopped = self._stopped()
+        if not stopped and not appeared:
             self._tlog("[提示] 超时未检测到游戏进程，可能本次无任务或已直接结束，继续下一步。")
-        else:
+        elif not stopped:
+            self._stage("running", "游戏运行中，等待任务完成", **event_base)
             self._tlog("[运行] 游戏已启动，等待助手完成并关闭游戏...")
             self._wait_until_all_gone(game_procs)
+            stopped = self._stopped()
         # 收尾：关闭助手进程
         for hp in helper_procs:
             _kill(hp, self._tlog)
-        self._tlog("[完成] %s" % name)
+        if not stopped:
+            self._tlog("[完成] %s" % name)
+        return "stopped" if stopped else "completed"
 
     def _run_pre_launch(self, p, pre):
         """先启动前置程序（如游戏本体），供 MaaEnd 这类无法自行开游戏的脚本使用。"""

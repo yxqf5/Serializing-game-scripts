@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 import os
 import sys
+import threading
 import unittest
+from unittest.mock import patch
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BASE not in sys.path:
@@ -31,6 +33,60 @@ class TestRunnerSkip(unittest.TestCase):
         self.assertEqual(len(skip_lines), 1)
         self.assertIn("坏配置", skip_lines[0])
         self.assertIn("未配置启动器路径", skip_lines[0])
+
+    def test_runner_emits_structured_events_and_keeps_old_log_api(self):
+        logs = []
+        events = []
+        runner = rc.Runner(logs.append, event_func=events.append)
+        runner.run_all([
+            {"name": "坏配置", "launcher": "", "enabled": True},
+        ])
+
+        self.assertTrue(any("[跳过]" in line for line in logs))
+        self.assertEqual(events[0]["type"], "queue_started")
+        self.assertEqual(events[1]["type"], "task_started")
+        self.assertEqual(events[1]["name"], "坏配置")
+        self.assertTrue(any(
+            event.get("type") == "task_finished" and event.get("result") == "skipped"
+            for event in events
+        ))
+        self.assertEqual(events[-1]["type"], "queue_finished")
+
+    def test_event_callback_failure_never_breaks_runner(self):
+        logs = []
+
+        def broken_event_callback(_event):
+            raise RuntimeError("UI callback failed")
+
+        runner = rc.Runner(logs.append, event_func=broken_event_callback)
+        runner.run_all([{"name": "坏配置", "launcher": ""}])
+        self.assertTrue(any("[跳过]" in line for line in logs))
+
+    def test_stop_still_runs_existing_helper_cleanup(self):
+        stop = threading.Event()
+        killed = []
+
+        class StopWhileWaitingRunner(rc.Runner):
+            def _wait_until_all_gone(self, procs):
+                stop.set()
+
+        plugin = {
+            "name": "测试停止收尾",
+            "launcher": __file__,
+            "args": [],
+            "wait_mode": "game",
+            "game_processes": ["Game.exe"],
+            "helper_processes": ["Helper.exe"],
+            "start_timeout_min": 1,
+        }
+        runner = StopWhileWaitingRunner(lambda _line: None, stop)
+        runner._wait_until_any_appear = lambda _procs, _timeout: True
+        with patch.object(rc.subprocess, "Popen"), patch.object(
+                rc, "_kill", side_effect=lambda name, _log, label="助手": killed.append((name, label))):
+            result = runner._run_one(1, 1, plugin)
+
+        self.assertEqual(result, "stopped")
+        self.assertIn(("Helper.exe", "助手"), killed)
 
     def test_run_all_logs_checklist_warnings(self):
         logs = []
