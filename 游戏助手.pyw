@@ -448,7 +448,7 @@ class App(tk.Tk):
 
     def _build_global_run_bar(self, parent):
         t = self.t
-        bar = tk.Frame(parent, bg=t["panel"], height=54,
+        bar = tk.Frame(parent, bg=t["panel"], height=72,
                        highlightthickness=1, highlightbackground=t["line"])
         bar.pack(side="bottom", fill="x")
         bar.pack_propagate(False)
@@ -464,13 +464,25 @@ class App(tk.Tk):
                                           fg=t["sub"], font=F(9), anchor="w")
         self.global_run_detail.pack(side="left", fill="x", expand=True, padx=(5, 0))
 
-        self.global_stop_btn = self._button(bar, "■ 停止", self.stop_run, danger=True, compact=True)
-        self.global_stop_btn.pack(side="right", padx=(6, 14), pady=10)
-        self.global_start_btn = self._button(bar, "▶ 开始运行", self.start_run, primary=True, compact=True)
-        self.global_start_btn.pack(side="right", padx=(6, 0), pady=10)
-        self.global_progress = ttk.Progressbar(bar, orient="horizontal", mode="determinate", length=96,
+        stop_slot = tk.Frame(bar, bg=t["panel"], width=148, height=50)
+        stop_slot.pack(side="right", padx=(8, 16), pady=10)
+        stop_slot.pack_propagate(False)
+        self.global_stop_btn = self._button(stop_slot, "■ 结束运行", self.stop_run, danger=True)
+        self.global_stop_btn.config(font=F(12, True), padx=12, pady=8)
+        self.global_stop_btn.pack(fill="both", expand=True)
+
+        start_slot = tk.Frame(bar, bg=t["panel"], width=148, height=50)
+        start_slot.pack(side="right", padx=(8, 0), pady=10)
+        start_slot.pack_propagate(False)
+        self.global_start_btn = self._button(start_slot, "▶ 开始运行", self.start_run, primary=True)
+        self.global_start_btn.config(font=F(12, True), padx=12, pady=8)
+        self.global_start_btn.pack(fill="both", expand=True)
+        self.global_progress = ttk.Progressbar(bar, orient="horizontal", mode="determinate", length=78,
                                                style="Run.Horizontal.TProgressbar")
-        self.global_progress.pack(side="right", padx=(8, 0), pady=20)
+        self.global_progress.pack(side="right", padx=(8, 0), pady=29)
+        # 运行控件优先获得固定宽度，状态文字使用剩余空间。
+        state.pack_forget()
+        state.pack(side="left", fill="both", expand=True, padx=(18, 10), pady=7)
         # 兼容旧的运行控制代码和其他页面引用。
         self.run_btn = self.global_start_btn
         self.stop_btn = self.global_stop_btn
