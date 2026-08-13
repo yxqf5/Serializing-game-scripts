@@ -65,24 +65,28 @@ THEMES = {
         "fg": "#f3f3f5", "sub": "#8b8b93", "accent": "#ff7a18", "on_accent": "#000000",
         "log_bg": "#0a0a0c", "log_fg": "#d8d8de",
         "ok": "#3ad07f", "warn": "#ffc24b", "err": "#ff5b5b",
+        "log_gold": "#ffd700", "log_blue": "#4da6ff",
     },
     "绝区零": {
         "bg": "#101012", "panel": "#1b1b1f", "line": "#2f2f35",
         "fg": "#ffffff", "sub": "#8a8a8a", "accent": "#ffe200", "on_accent": "#000000",
         "log_bg": "#0b0b0d", "log_fg": "#e6e6e6",
         "ok": "#5be37a", "warn": "#ffd23f", "err": "#ff5252",
+        "log_gold": "#ffd700", "log_blue": "#4da6ff",
     },
     "英伦": {
         "bg": "#0f2240", "panel": "#16304f", "line": "#27466e",
         "fg": "#f3ecd8", "sub": "#a8b4cc", "accent": "#d11a2a", "on_accent": "#ffffff",
         "log_bg": "#0b1a32", "log_fg": "#e8e2cf",
         "ok": "#5bc88a", "warn": "#e6b800", "err": "#ff6b6b",
+        "log_gold": "#e3c15c", "log_blue": "#6fb3ff",
     },
     "极简": {
         "bg": "#f4f4f6", "panel": "#ffffff", "line": "#e4e4ea",
         "fg": "#1d1d1f", "sub": "#86868b", "accent": "#0a84ff", "on_accent": "#ffffff",
         "log_bg": "#fbfbfd", "log_fg": "#33333a",
         "ok": "#1aa34a", "warn": "#c77700", "err": "#d83a3a",
+        "log_gold": "#8a6d00", "log_blue": "#0066cc",
     },
 }
 DEFAULT_THEME = "橙黑"
@@ -630,8 +634,8 @@ class App(tk.Tk):
         self.log_widget.pack(side="left", fill="both", expand=True)
         self.log_widget.tag_configure("log_err", foreground=t["err"])
         self.log_widget.tag_configure("log_warn", foreground=t["warn"])
-        self.log_widget.tag_configure("log_gold", foreground="#ffd700")
-        self.log_widget.tag_configure("log_blue", foreground="#4da6ff")
+        self.log_widget.tag_configure("log_gold", foreground=t["log_gold"])
+        self.log_widget.tag_configure("log_blue", foreground=t["log_blue"])
         self.log_widget.tag_configure("log_ok", foreground=t["ok"])
         self.log_widget.bind("<MouseWheel>", self._on_log_mousewheel)
         self.log_widget.bind("<Button-4>", self._on_log_mousewheel)
@@ -2327,8 +2331,8 @@ class App(tk.Tk):
             try:
                 runner.run_all(active)
             except Exception as e:
-                self._enqueue_log("发生错误：%s" % e)
-            self.log_queue.put(("__DONE__", None))
+                self._enqueue_log("发生错误：%s" % e, level="error")
+            self.log_queue.put(("__DONE__", None, None))
 
         self.run_thread = threading.Thread(target=worker, daemon=True)
         self.run_thread.start()
@@ -2340,10 +2344,10 @@ class App(tk.Tk):
         self.run_state["state"] = "stopping"
         self.run_state["message"] = "正在结束当前等待…"
         self._refresh_run_buttons()
-        self._enqueue_log("已请求停止，正在结束当前等待…")
+        self._enqueue_log("已请求停止，正在结束当前等待…", level="warn")
 
-    def _enqueue_log(self, msg):
-        self.log_queue.put(("line", msg))
+    def _enqueue_log(self, msg, level=None):
+        self.log_queue.put(("line", msg, level))
 
     def _enqueue_run_event(self, event):
         self.ui_queue.put(("run_event", event))
@@ -2373,7 +2377,18 @@ class App(tk.Tk):
                                   message=("用户已停止本轮任务" if result == "stopped" else "全部任务执行完成"))
         self._update_global_run_bar()
 
-    def _log_tag_for(self, msg):
+    def _log_tag_for(self, msg, level=None):
+        """日志着色：结构化级别优先，无级别时回退到旧的关键字匹配。"""
+        if level:
+            tag = {
+                "error": "log_err",
+                "warn": "log_warn",
+                "gold": "log_gold",
+                "blue": "log_blue",
+                "ok": "log_ok",
+            }.get(level)
+            if tag:
+                return tag
         if "[每日未完成]" in msg:
             return "log_err"
         if "[每日完成]" in msg:
@@ -2521,11 +2536,14 @@ class App(tk.Tk):
         done = False
         try:
             while len(lines) < 500 and (time.perf_counter() - start) < 0.016:
-                kind, msg = self.log_queue.get_nowait()
+                item = self.log_queue.get_nowait()
+                kind = item[0]
                 if kind == "__DONE__":
                     done = True
+                elif len(item) >= 3:
+                    lines.append((str(item[1]).rstrip("\r\n"), item[2]))
                 else:
-                    lines.append(str(msg).rstrip("\r\n"))
+                    lines.append((str(item[1]).rstrip("\r\n"), None))
         except queue.Empty:
             pass
 

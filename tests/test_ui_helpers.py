@@ -15,13 +15,19 @@ class TestLogStore(unittest.TestCase):
         store = LogStore(max_lines=3)
         dropped = store.append_many(["a", "b", "c", "d"])
         self.assertEqual(dropped, 1)
-        self.assertEqual(store.lines, ["b", "c", "d"])
+        self.assertEqual([t for t, _ in store.lines], ["b", "c", "d"])
         self.assertEqual(store.dropped_total, 1)
 
     def test_export_text_has_one_trailing_newline(self):
         store = LogStore(max_lines=10)
         store.append_many(["a\n", "b"])
         self.assertEqual(store.export_text(), "a\nb\n")
+
+    def test_accepts_structured_level_entries(self):
+        store = LogStore(max_lines=10)
+        store.append_many([("完成", "gold"), "普通", ("出错", "error")])
+        self.assertEqual(store.lines, [("完成", "gold"), ("普通", None), ("出错", "error")])
+        self.assertEqual(store.export_text(), "完成\n普通\n出错\n")
 
 
 class TestBatchHelpers(unittest.TestCase):
@@ -34,6 +40,20 @@ class TestBatchHelpers(unittest.TestCase):
             (None, "普通\n"),
             ("warn", "[警告] 一\n[警告] 二\n"),
             (None, "普通二\n"),
+        ])
+
+    def test_groups_leveled_entries_pass_level_to_tag_func(self):
+        def tag_func(line, level=None):
+            return level or ("warn" if "[警告]" in line else None)
+
+        groups = group_tagged_lines(
+            ["普通", ("完成", "gold"), ("第二行", "gold"), "[警告] 一"],
+            tag_func,
+        )
+        self.assertEqual(groups, [
+            (None, "普通\n"),
+            ("gold", "完成\n第二行\n"),
+            ("warn", "[警告] 一\n"),
         ])
 
     def test_elides_middle_without_losing_filename(self):

@@ -153,6 +153,90 @@ class TestScriptLogWatcher(unittest.TestCase):
             self.assertEqual(len(result["daily_done"]), 1)
             self.assertIn("82", result["stamina"][0])
 
+    def test_line_split_across_polls_not_missed_or_misread(self):
+        """一行日志被两次 poll 截断：不误报也不漏报。"""
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "split.log")
+            _write_gbk(p, "")
+            w = lw.ScriptLogWatcher(log_file=p, encoding="gbk",
+                                    daily_done_patterns=["每日实训已完成"])
+            self.assertTrue(w.start())
+            _append_gbk(p, "2026-08-02 | INFO | 每日实训")
+            w.poll()  # 只写了半行：半行被缓存，不参与分类
+            self.assertEqual(w._daily_done, [])
+            _append_gbk(p, "已完成\n")
+            w.poll()
+            result = w.finish()
+            self.assertEqual(len(result["daily_done"]), 1)
+
+    def test_multibyte_char_split_across_polls_utf8(self):
+        """utf-8 三字节汉字被 chunk 边界截断：不产生乱码、正常匹配。"""
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "mb.log")
+            _write_gbk(p, "")
+            w = lw.ScriptLogWatcher(log_file=p, encoding="utf-8",
+                                    daily_done_patterns=["已完成"])
+            w.start()
+            full = "任务已完成".encode("utf-8")
+            with open(p, "ab") as f:
+                f.write(full[:7])  # 截断在「已」的第二个字节处
+            w.poll()
+            with open(p, "ab") as f:
+                f.write(full[7:])
+            w.poll()
+            result = w.finish()
+            self.assertEqual(len(result["daily_done"]), 1)
+            self.assertNotIn("\ufffd", result["daily_done"][0])
+
+    def test_multibyte_char_split_across_polls_gbk(self):
+        """gbk 双字节汉字被 chunk 边界截断：正常匹配。"""
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "mbg.log")
+            _write_gbk(p, "")
+            w = lw.ScriptLogWatcher(log_file=p, encoding="gbk",
+                                    daily_done_patterns=["已完成"])
+            w.start()
+            full = "日常已完成".encode("gbk")
+            with open(p, "ab") as f:
+                f.write(full[:5])  # 截断在「已」的引导字节处
+            w.poll()
+            with open(p, "ab") as f:
+                f.write(full[5:])
+            w.poll()
+            result = w.finish()
+            self.assertEqual(len(result["daily_done"]), 1)
+
+    def test_rotation_new_file_larger_than_offset(self):
+        """日志被替换成更大的新文件：从新文件开头重读（旧实现会漏掉开头）。"""
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "rot.log")
+            newp = os.path.join(d, "new.log")
+            _write_gbk(p, "旧日志内容，用于占满 offset\n")
+            w = lw.ScriptLogWatcher(log_file=p, encoding="gbk",
+                                    daily_done_patterns=["新任务已完成"])
+            self.assertTrue(w.start())
+            # 新文件比旧 offset 更大，且匹配行位于旧 offset 之前
+            _write_gbk(newp, "新任务已完成\n" + "x" * 100)
+            os.replace(newp, p)
+            w.poll()
+            result = w.finish()
+            self.assertTrue(any("新任务已完成" in line for line in result["daily_done"]))
+
+    def test_finish_caps_per_category_and_reports_truncation(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "cap.log")
+            _write_gbk(p, "")
+            w = lw.ScriptLogWatcher(log_file=p, encoding="gbk",
+                                    daily_done_patterns=["完成"], max_per_category=5)
+            w.start()
+            _append_gbk(p, "".join("第%d次完成\n" % i for i in range(12)))
+            w.poll()
+            result = w.finish()
+            self.assertEqual(len(result["daily_done"]), 5)
+            self.assertTrue(result["truncated"]["daily_done"])
+            self.assertIn("第11次完成", result["daily_done"][-1])
+            self.assertFalse(result["truncated"]["stamina"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,7 +3,11 @@
 
 
 class LogStore:
-    """有上限的内存日志，始终保留最新内容。"""
+    """有上限的内存日志，始终保留最新内容。
+
+    每条记录为 (text, level) 元组（level 为结构化日志级别字符串或 None）；
+    为兼容旧调用，append_many 也接受纯字符串（level 记为 None）。
+    """
 
     def __init__(self, max_lines=10000):
         self.max_lines = max(1, int(max_lines))
@@ -14,8 +18,16 @@ class LogStore:
         self.lines = []
         self.dropped_total = 0
 
+    @staticmethod
+    def _normalize(line):
+        if isinstance(line, tuple):
+            text = line[0] if line else ""
+            level = line[1] if len(line) > 1 else None
+            return (str(text).rstrip("\r\n"), level)
+        return (str(line).rstrip("\r\n"), None)
+
     def append_many(self, lines):
-        normalized = [str(line).rstrip("\r\n") for line in lines]
+        normalized = [self._normalize(line) for line in lines]
         if not normalized:
             return 0
         self.lines.extend(normalized)
@@ -26,17 +38,28 @@ class LogStore:
         return overflow
 
     def export_text(self):
-        return ("\n".join(self.lines) + "\n") if self.lines else ""
+        return ("\n".join(text for text, _ in self.lines) + "\n") if self.lines else ""
 
 
 def group_tagged_lines(lines, tag_func):
-    """把相邻且颜色标签相同的日志合成一次 Text.insert。"""
+    """把相邻且颜色标签相同的日志合成一次 Text.insert。
+
+    lines 元素可为 (text, level) 元组或纯字符串：
+      - 元组：tag = tag_func(text, level)（level 优先由界面映射为颜色）
+      - 字符串：tag = tag_func(text)（旧接口，向后兼容）
+    """
     groups = []
     current_tag = object()
     current_lines = []
     for raw in lines:
-        line = str(raw).rstrip("\r\n")
-        tag = tag_func(line)
+        if isinstance(raw, tuple):
+            text = raw[0] if raw else ""
+            level = raw[1] if len(raw) > 1 else None
+            line = str(text).rstrip("\r\n")
+            tag = tag_func(line, level)
+        else:
+            line = str(raw).rstrip("\r\n")
+            tag = tag_func(line)
         if current_lines and tag != current_tag:
             groups.append((current_tag, "\n".join(current_lines) + "\n"))
             current_lines = []

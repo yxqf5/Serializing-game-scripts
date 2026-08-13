@@ -24,15 +24,41 @@ import re
 
 DEFAULT_ENCODINGS = ["utf-8", "gbk"]
 
+# 多字节编码一个字符最多占 3 个字节（utf-8 三字节序列 / gbk 双字节）
+MAX_INCOMPLETE_TAIL = 3
 
-def _decode_candidates(data, encodings):
-    """按候选编码顺序解码字节串，全部失败则 utf-8 容错兜底。"""
+
+def _decode_incremental(data, encodings):
+    """
+    增量解码新增字节，处理「多字节字符被两次 poll 截断」的情况。
+
+    返回 (text, pending)：
+      - text    本块能完整解码出的文本
+      - pending 可能属于下一个多字节字符的尾部字节，须与下次读到的数据拼接后再解码
+
+    解码失败时先尝试去掉末尾 1..3 字节重试（截断的多字节字符会让整体解码报错）；
+    若仍失败（文件本身混入坏字节）则 utf-8 容错兜底且不保留 pending。
+    """
+    if not data:
+        return "", b""
+    text, enc = _try_decode(data, encodings)
+    if text is not None:
+        return text, b""
+    for drop in range(1, min(MAX_INCOMPLETE_TAIL, len(data)) + 1):
+        text, enc = _try_decode(data[:-drop], encodings)
+        if text is not None:
+            return text, data[-drop:]
+    return data.decode("utf-8", errors="replace"), b""
+
+
+def _try_decode(data, encodings):
+    """按候选编码顺序严格解码；全部失败返回 (None, None)。"""
     for enc in encodings:
         try:
-            return data.decode(enc)
+            return data.decode(enc), enc
         except (UnicodeDecodeError, LookupError):
             continue
-    return data.decode("utf-8", errors="replace")
+    return None, None
 
 
 def resolve_log_file(pattern):
@@ -67,15 +93,19 @@ class ScriptLogWatcher:
 
     def __init__(self, log_file="", encoding="auto",
                  daily_done_patterns=None, daily_pending_patterns=None,
-                 stamina_patterns=None):
+                 stamina_patterns=None, max_per_category=20):
         self.pattern = (log_file or "").strip().strip('"')
         self.encoding = encoding or "auto"
         self.daily_done_re = self._compile(daily_done_patterns)
         self.daily_pending_re = self._compile(daily_pending_patterns)
         self.stamina_re = self._compile(stamina_patterns)
+        self.max_per_category = max(1, int(max_per_category))
 
         self.path = None
         self._offset = 0
+        self._pending = b""    # 上次 poll 未解完的多字节尾部
+        self._partial = ""     # 上次 poll 未写完（无换行结尾）的半行
+        self._ctime_ns = None  # Windows 下用于识别「文件被替换成更大的新文件」
         self._daily_done = []
         self._daily_pending = []
         self._stamina = []
@@ -105,9 +135,14 @@ class ScriptLogWatcher:
         """记录起始位置；返回日志文件是否可用。"""
         self.path = resolve_log_file(self.pattern)
         self._offset = 0
+        self._pending = b""
+        self._partial = ""
+        self._ctime_ns = None
         if self.path:
             try:
-                self._offset = os.path.getsize(self.path)
+                st = os.stat(self.path)
+                self._offset = st.st_size
+                self._ctime_ns = st.st_ctime_ns if os.name == "nt" else None
             except OSError:
                 self._offset = 0
         return self.path is not None
@@ -120,13 +155,18 @@ class ScriptLogWatcher:
         if not path:
             return
         try:
-            size = os.path.getsize(path)
+            st = os.stat(path)
         except OSError:
             return
-        if path != self.path or size < self._offset:
-            # 日志轮转：换文件或文件被清空，从新文件开头读
+        size = st.st_size
+        ctime = st.st_ctime_ns if os.name == "nt" else None
+        if path != self.path or size < self._offset or (ctime is not None and ctime != self._ctime_ns):
+            # 日志轮转：换文件/被替换/被清空（含新文件比旧 offset 更大的情况），从头读
             self.path = path
             self._offset = 0
+            self._pending = b""
+            self._partial = ""
+            self._ctime_ns = ctime
         if size <= self._offset:
             return
         try:
@@ -136,23 +176,64 @@ class ScriptLogWatcher:
         except OSError:
             return
         self._offset = size
-        text = _decode_candidates(data, self._encodings())
-        for line in text.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            if self.stamina_re and any(r.search(line) for r in self.stamina_re):
-                # 体力/理智：只保留最新一条
-                self._stamina = [line]
-            elif self.daily_pending_re and any(r.search(line) for r in self.daily_pending_re):
-                self._daily_pending.append(line)
-            elif self.daily_done_re and any(r.search(line) for r in self.daily_done_re):
-                self._daily_done.append(line)
+        if self._pending:
+            data = self._pending + data
+        text, self._pending = _decode_incremental(data, self._encodings())
+        if self._partial:
+            # 上次未写完的半行拼到本次文本前，凑成完整行再分类
+            text = self._partial + text
+            self._partial = ""
+        parts = text.splitlines()
+        if text and not text.endswith(("\n", "\r")) and parts:
+            # 最后一行还没写完（无换行结尾），与下一块拼成完整行再分类，
+            # 避免一行被两次 poll 截断时漏报/误报
+            self._partial = parts.pop()
+        for line in parts:
+            self._classify_line(line)
+
+    def _classify_line(self, line):
+        line = line.strip()
+        if not line:
+            return
+        if self.stamina_re and any(r.search(line) for r in self.stamina_re):
+            # 体力/理智：只保留最新一条
+            self._stamina = [line]
+        elif self.daily_pending_re and any(r.search(line) for r in self.daily_pending_re):
+            self._daily_pending.append(line)
+        elif self.daily_done_re and any(r.search(line) for r in self.daily_done_re):
+            self._daily_done.append(line)
+
+    def _flush_tail(self):
+        """流结束时处理尚未成行的残留（未完成的多字节尾部 + 未换行的最后一行）。"""
+        if not self._pending and not self._partial:
+            return
+        tail = self._partial
+        self._partial = ""
+        if self._pending:
+            tail += self._pending.decode("utf-8", errors="replace")
+            self._pending = b""
+        if tail:
+            self._classify_line(tail)
 
     def finish(self):
-        """返回本次运行提取的三类信息。"""
-        return {
-            "daily_done": _dedup_keep_order(self._daily_done),
-            "daily_pending": _dedup_keep_order(self._daily_pending),
-            "stamina": list(self._stamina),
-        }
+        """
+        返回本次运行提取的三类信息（每类去重后最多保留最新 max_per_category 条）。
+
+        返回 dict：daily_done / daily_pending / stamina 为行列表，
+        truncated 为 {分类: bool}，标记该分类是否因超出上限被截断。
+        """
+        self._flush_tail()
+        out = {}
+        truncated = {"daily_done": False, "daily_pending": False, "stamina": False}
+        for key, collected in (
+            ("daily_done", self._daily_done),
+            ("daily_pending", self._daily_pending),
+            ("stamina", self._stamina),
+        ):
+            uniq = _dedup_keep_order(collected)
+            if len(uniq) > self.max_per_category:
+                truncated[key] = True
+                uniq = uniq[-self.max_per_category:]
+            out[key] = uniq
+        out["truncated"] = truncated
+        return out

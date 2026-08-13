@@ -162,5 +162,68 @@ class TestRunnerSkip(unittest.TestCase):
         self.assertEqual(cmd, [r"D:\Game\Endfield.exe"])
 
 
+class FakeWatcher:
+    """日志监控替身：记录 poll 次数并返回固定提取结果。"""
+
+    max_per_category = 20
+
+    def __init__(self, result=None):
+        self.result = result or {
+            "daily_done": ["完成一"],
+            "daily_pending": [],
+            "stamina": [],
+            "truncated": {},
+        }
+        self.polls = 0
+
+    def poll(self):
+        self.polls += 1
+
+    def finish(self):
+        return self.result
+
+
+class TestRunnerLogReporting(unittest.TestCase):
+    def test_report_result_only_prints_configured_sections(self):
+        """未配置的分类不再输出「未捕捉到相关记录」噪音。"""
+        logs = []
+        runner = rc.Runner(lambda msg, level=None: logs.append((msg, level)), settle_sec=0)
+        runner._report_task_result(
+            {"name": "测试游戏", "daily_done_patterns": ["完成"]}, FakeWatcher())
+        texts = [m for m, _ in logs]
+        self.assertTrue(any("[每日完成]" in m for m in texts))
+        self.assertFalse(any("[每日未完成]" in m for m in texts))
+        self.assertFalse(any("[体力]" in m for m in texts))
+        self.assertTrue(any("[每日完成]" in m and lvl == "gold" for m, lvl in logs))
+
+    def test_report_result_no_patterns_prints_nothing(self):
+        logs = []
+        runner = rc.Runner(lambda msg, level=None: logs.append((msg, level)), settle_sec=0)
+        runner._report_task_result({"name": "测试游戏"}, FakeWatcher())
+        self.assertEqual(logs, [])
+
+    def test_report_result_final_poll_after_settle(self):
+        """报告前必须强制 poll 一次，避免最后一截日志漏读。"""
+        w = FakeWatcher()
+        runner = rc.Runner(lambda msg, level=None: None, settle_sec=0)
+        runner._report_task_result({"name": "测试游戏", "daily_done_patterns": ["完成"]}, w)
+        self.assertGreaterEqual(w.polls, 1)
+
+    def test_runner_logs_carry_structured_levels(self):
+        """level 关键字传给支持它的 log 回调（旧回调仍可用）。"""
+        logs = []
+        runner = rc.Runner(lambda msg, level=None: logs.append((msg, level)), settle_sec=0)
+        runner.run_all([{"name": "坏配置", "launcher": ""}])
+        self.assertTrue(any(lvl == "error" and "[跳过]" in m for m, lvl in logs))
+        self.assertTrue(any(lvl == "ok" and "全部任务执行完成" in m for m, lvl in logs))
+
+    def test_log_func_without_level_still_works(self):
+        """只接受 msg 的旧回调不受影响。"""
+        logs = []
+        runner = rc.Runner(logs.append, settle_sec=0)
+        runner.run_all([{"name": "坏配置", "launcher": ""}])
+        self.assertTrue(any("[跳过]" in line for line in logs))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -14,6 +14,7 @@ import os
 import time
 import subprocess
 import datetime
+import inspect
 
 try:
     import ctypes
@@ -32,6 +33,26 @@ except ImportError:
 
 # 让所有内部命令（tasklist/taskkill）不弹出黑色控制台窗口
 CREATE_NO_WINDOW = 0x08000000
+
+# 结构化日志级别（界面据此着色，不再依赖日志文字里的魔法标记）
+LEVEL_INFO = "info"
+LEVEL_WARN = "warn"
+LEVEL_ERROR = "error"
+LEVEL_OK = "ok"
+LEVEL_GOLD = "gold"
+LEVEL_BLUE = "blue"
+
+
+def _func_accepts_kwarg(func, name):
+    """判断 log 回调是否接受额外的 level 关键字参数（旧回调只有 msg 也能用）。"""
+    try:
+        sig = inspect.signature(func)
+    except (TypeError, ValueError):
+        return False
+    for p in sig.parameters.values():
+        if p.kind == inspect.Parameter.VAR_KEYWORD or p.name == name:
+            return True
+    return False
 
 if ctypes and os.name == "nt":
     class _PROCESSENTRY32W(ctypes.Structure):
@@ -120,12 +141,12 @@ def snapshot_running_processes():
     return names
 
 
-def _kill(image_name, log, label="助手"):
+def _kill(image_name, log, label="助手", level=LEVEL_INFO):
     try:
         subprocess.run(["taskkill", "/f", "/im", image_name], **_hidden_kwargs())
-        log("  已关闭%s进程：%s" % (label, image_name))
+        log("  已关闭%s进程：%s" % (label, image_name), level=level)
     except Exception as e:
-        log("  关闭 %s 失败：%s" % (image_name, e))
+        log("  关闭 %s 失败：%s" % (image_name, e), level=LEVEL_WARN)
 
 
 def plugin_skip_reason(p):
@@ -154,10 +175,13 @@ def build_pre_cmd(pre, pre_args, method="explorer"):
 
 
 class Runner:
-    def __init__(self, log_func, stop_event=None, event_func=None):
+    def __init__(self, log_func, stop_event=None, event_func=None, settle_sec=1.0):
         self.log = log_func
         self.stop_event = stop_event
         self.event_func = event_func
+        # 任务结束后给脚本日志落盘留出的缓冲秒数（最终 poll 前等待）
+        self.settle_sec = max(0.0, float(settle_sec))
+        self._log_accepts_level = _func_accepts_kwarg(log_func, "level")
 
     def _emit(self, event_type, **payload):
         """发送结构化运行事件；界面回调失败不能打断串行任务。"""
@@ -177,9 +201,16 @@ class Runner:
     def _stopped(self):
         return self.stop_event is not None and self.stop_event.is_set()
 
-    def _tlog(self, msg):
+    def _log(self, msg, level=LEVEL_INFO):
+        """输出日志；兼容只接受 msg 的旧回调。"""
+        if self._log_accepts_level:
+            self.log(msg, level=level)
+        else:
+            self.log(msg)
+
+    def _tlog(self, msg, level=LEVEL_INFO):
         """带时间戳输出。"""
-        self.log("[%s] %s" % (now_str(), msg))
+        self._log("[%s] %s" % (now_str(), msg), level)
 
     def _log_checklist_warnings(self, p):
         """未完成脚本侧待办时输出警告（界面会以黄色显示）。"""
@@ -191,45 +222,46 @@ class Runner:
         name = p.get("name", p.get("id", "未知"))
         doc = (p.get("doc_url") or "").strip()
         self._tlog("[警告] %s 有 %d 项脚本侧设置未完成，可能影响运行或无法自动切换下一个：" % (
-            name, len(pending)))
+            name, len(pending)), level=LEVEL_WARN)
         for i, item in enumerate(pending, 1):
-            self._tlog("[警告]   %d. %s" % (i, item))
-        self._tlog("[警告]   修改方法：主页点该游戏「编辑」→ 按待办说明在脚本内完成设置 → 勾选待办。")
+            self._tlog("[警告]   %d. %s" % (i, item), level=LEVEL_WARN)
+        self._tlog("[警告]   修改方法：主页点该游戏「编辑」→ 按待办说明在脚本内完成设置 → 勾选待办。",
+                   level=LEVEL_WARN)
         if doc:
-            self._tlog("[警告]   官方文档：%s" % doc)
+            self._tlog("[警告]   官方文档：%s" % doc, level=LEVEL_WARN)
 
     def run_all(self, plugins):
         """plugins：已按 order 排序、且只含 enabled 的插件 dict 列表。"""
         total = len(plugins)
         self._emit("queue_started", total=total)
         self._tlog("开始串行执行，共 %d 个游戏。" % total)
-        self.log("")
+        self._log("")
         for idx, p in enumerate(plugins, 1):
             if self._stopped():
-                self._tlog("已被用户中止。")
+                self._tlog("已被用户中止。", level=LEVEL_WARN)
                 self._emit("queue_finished", result="stopped", total=total)
                 return
             name = p.get("name", p.get("id", "未知"))
             self._emit("task_started", index=idx, total=total, name=name)
             result = self._run_one(idx, total, p)
             self._emit("task_finished", index=idx, total=total, name=name, result=result)
-            self.log("")
+            self._log("")
             if result == "stopped":
-                self._tlog("已被用户中止。")
+                self._tlog("已被用户中止。", level=LEVEL_WARN)
                 self._emit("queue_finished", result="stopped", total=total)
                 return
-        self._tlog("全部任务执行完成。")
+        self._tlog("全部任务执行完成。", level=LEVEL_OK)
         self._emit("queue_finished", result="completed", total=total)
 
     def _run_one(self, idx, total, p):
         name = p.get("name", p.get("id", "未知"))
-        self._tlog("========== (%d/%d) %s ==========" % (idx, total, name))
+        self._tlog("========== (%d/%d) %s ==========" % (idx, total, name), level=LEVEL_OK)
         event_base = {"index": idx, "total": total, "name": name}
         self._stage("checking", "正在检查配置", **event_base)
 
         skip = plugin_skip_reason(p)
         if skip:
-            self._tlog("[跳过] %s — %s" % (name, skip))
+            self._tlog("[跳过] %s — %s" % (name, skip), level=LEVEL_ERROR)
             return "skipped"
 
         self._log_checklist_warnings(p)
@@ -250,7 +282,7 @@ class Runner:
             subprocess.Popen(cmd, cwd=workdir)
             self._tlog("[启动] %s %s" % (os.path.basename(launcher), " ".join(args)))
         except Exception as e:
-            self._tlog("[失败] 启动出错：%s" % e)
+            self._tlog("[失败] 启动出错：%s" % e, level=LEVEL_ERROR)
             return "failed"
 
         wait_mode = p.get("wait_mode", "game")
@@ -271,7 +303,7 @@ class Runner:
                 if _tasklist_running(gp):
                     _kill(gp, self._tlog, label="游戏")
             if not stopped:
-                self._tlog("[完成] %s" % name)
+                self._tlog("[完成] %s" % name, level=LEVEL_OK)
             return "stopped" if stopped else "completed"
 
         # wait_mode == "game"
@@ -293,14 +325,14 @@ class Runner:
         for hp in helper_procs:
             _kill(hp, self._tlog)
         if not stopped:
-            self._tlog("[完成] %s" % name)
+            self._tlog("[完成] %s" % name, level=LEVEL_OK)
         return "stopped" if stopped else "completed"
 
     def _run_pre_launch(self, p, pre):
         """先启动前置程序（如游戏本体），供 MaaEnd 这类无法自行开游戏的脚本使用。"""
         pre_name = os.path.basename(pre)
         if not os.path.isfile(pre):
-            self._tlog("[警告] 前置程序不存在，已跳过：%s" % pre)
+            self._tlog("[警告] 前置程序不存在，已跳过：%s" % pre, level=LEVEL_WARN)
             return
         pre_args = [str(a) for a in (p.get("pre_args") or [])]
         skip_if_running = bool(p.get("pre_skip_if_running", True))
@@ -316,7 +348,7 @@ class Runner:
             else:
                 self._tlog("[前置] 已启动：%s %s" % (pre_name, " ".join(pre_args)))
         except Exception as e:
-            self._tlog("[警告] 前置程序启动失败：%s" % e)
+            self._tlog("[警告] 前置程序启动失败：%s" % e, level=LEVEL_WARN)
             return
         delay = 0
         try:
@@ -354,36 +386,47 @@ class Runner:
         return None
 
     def _report_task_result(self, p, watcher):
-        """脚本退出后输出任务结果：每日奖励完成/未完成 + 最新体力剩余。"""
+        """脚本退出后输出任务结果：每日奖励完成/未完成 + 最新体力剩余。
+
+        只输出配置了提取关键词的分类；输出前等 settle_sec 让脚本最后几行
+        日志落盘，并强制 poll 一次，避免最后一截日志漏读。
+        """
         if watcher is None:
             return
+        if not self._stopped() and self.settle_sec > 0:
+            self._sleep_interruptible(self.settle_sec)
+        watcher.poll()  # 确保读完最后一截增量
         result = watcher.finish()
         name = p.get("name", p.get("id", "未知"))
-        self._tlog("──────── 任务结果 · %s ────────" % name)
 
-        self.log("  🎁 [每日完成] 每日奖励 · 已完成：")
-        if result["daily_done"]:
-            for line in result["daily_done"]:
-                self.log("    · %s" % line)
-        else:
-            self.log("    · 未捕捉到相关记录")
-
-        self.log("  ❌ [每日未完成] 每日奖励 · 未完成/未领取：")
-        if result["daily_pending"]:
-            for line in result["daily_pending"]:
-                self.log("    · %s" % line)
-        else:
-            self.log("    · 未捕捉到相关记录")
-
-        self.log("  ⚡ [体力] 剩余体力/理智：")
-        if result["stamina"]:
-            for line in result["stamina"]:
-                self.log("    · %s" % line)
-        else:
-            self.log("    · 未捕捉到相关记录")
-        self._tlog("──────── 结果输出完毕 ────────")
+        sections = []
+        if p.get("daily_done_patterns"):
+            sections.append(("daily_done", "  🎁 [每日完成] 每日奖励 · 已完成：", LEVEL_GOLD))
+        if p.get("daily_pending_patterns"):
+            sections.append(("daily_pending", "  ❌ [每日未完成] 每日奖励 · 未完成/未领取：", LEVEL_ERROR))
+        if p.get("stamina_patterns"):
+            sections.append(("stamina", "  ⚡ [体力] 剩余体力/理智：", LEVEL_BLUE))
+        if not sections:
+            # 配了日志文件但没配任何提取关键词：不输出结果区，避免纯噪音
+            return
+        self._tlog("──────── 任务结果 · %s ────────" % name, level=LEVEL_OK)
+        truncated = result.get("truncated", {})
+        for key, title, level in sections:
+            self._log(title, level=level)
+            lines = result.get(key) or []
+            if lines:
+                for line in lines:
+                    self._log("    · %s" % line, level=level)
+            else:
+                self._log("    · 未捕捉到相关记录", level=level)
+            if truncated.get(key):
+                self._log("    · （匹配行过多，仅显示最新 %d 条）" % watcher.max_per_category,
+                          level=level)
+        self._tlog("──────── 结果输出完毕 ────────", level=LEVEL_OK)
 
     def _wait_until_any_appear(self, procs, timeout_min, on_tick=None):
+        if on_tick:
+            on_tick()  # 即使进程列表为空也至少 poll 一次，避免日志完全没被读
         if not procs:
             return False
         deadline = time.time() + timeout_min * 60
@@ -399,6 +442,8 @@ class Runner:
         return False
 
     def _wait_until_all_gone(self, procs, on_tick=None):
+        if on_tick:
+            on_tick()  # 即使进程列表为空也至少 poll 一次
         if not procs:
             return
         while True:
