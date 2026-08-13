@@ -630,6 +630,8 @@ class App(tk.Tk):
         self.log_widget.pack(side="left", fill="both", expand=True)
         self.log_widget.tag_configure("log_err", foreground=t["err"])
         self.log_widget.tag_configure("log_warn", foreground=t["warn"])
+        self.log_widget.tag_configure("log_gold", foreground="#ffd700")
+        self.log_widget.tag_configure("log_blue", foreground="#4da6ff")
         self.log_widget.tag_configure("log_ok", foreground=t["ok"])
         self.log_widget.bind("<MouseWheel>", self._on_log_mousewheel)
         self.log_widget.bind("<Button-4>", self._on_log_mousewheel)
@@ -1064,6 +1066,40 @@ class App(tk.Tk):
         self.e_pre_delay.delete(0, "end"); self.e_pre_delay.insert(0, str(p.get("pre_delay_sec", 0)))
         self.e_pre_delay.pack(anchor="w", ipady=3)
 
+        label("任务日志提取（可留空则跳过）",
+              "读取脚本自身日志，只提取：每日奖励完成（金色）/未完成（红色）/最新体力剩余（蓝色）。",
+              parent=self.advanced_frame)
+        lf = tk.Frame(self.advanced_frame, bg=t["bg"]); lf.pack(fill="x")
+        self.e_log_file = tk.Entry(lf, font=("Consolas", 11), bg=t["panel"], fg=t["fg"],
+                                   insertbackground=t["fg"], relief="flat", highlightthickness=1,
+                                   highlightbackground=t["line"], highlightcolor=t["accent"])
+        self.e_log_file.insert(0, p.get("log_file", ""))
+        self.e_log_file.pack(side="left", fill="x", expand=True, ipady=5)
+        self._chip(lf, "浏览…", self._browse_log).pack(side="left", padx=(8, 0))
+
+        tk.Label(self.advanced_frame, text="日志编码", bg=t["bg"], fg=t["fg"],
+                 font=F(11, True), anchor="w").pack(anchor="w", pady=(14, 0))
+        self.e_log_enc = ttk.Combobox(self.advanced_frame, values=["auto", "gbk", "utf-8"],
+                                      width=12, font=F(10), state="readonly")
+        enc_val = (p.get("log_encoding") or "auto").strip().lower()
+        self.e_log_enc.set(enc_val if enc_val in ("auto", "gbk", "utf-8") else "auto")
+        self.e_log_enc.pack(anchor="w", ipady=2)
+
+        label("每日奖励·已完成关键词（逗号分隔，金色）", "例：今日奖励已领取, 每日实训已完成。",
+              parent=self.advanced_frame)
+        self.e_daily_done = entry(self.advanced_frame,
+                                  ", ".join(p.get("daily_done_patterns", [])), mono=True)
+
+        label("每日奖励·未完成关键词（逗号分隔，红色）", "例：未领取, 未检测到每日实训奖励。",
+              parent=self.advanced_frame)
+        self.e_daily_pending = entry(self.advanced_frame,
+                                     ", ".join(p.get("daily_pending_patterns", [])), mono=True)
+
+        label("体力/理智关键词（逗号分隔，蓝色，只取最新一条）", "例：开拓力, Current Sanity。",
+              parent=self.advanced_frame)
+        self.e_stamina = entry(self.advanced_frame,
+                               ", ".join(p.get("stamina_patterns", [])), mono=True)
+
         tk.Label(self.advanced_frame, text="完成判定方式", bg=t["bg"], fg=t["fg"],
                  font=F(11, True), anchor="w").pack(anchor="w", pady=(14, 0))
         self.wait_var = tk.StringVar(value=p.get("wait_mode", "game"))
@@ -1123,6 +1159,14 @@ class App(tk.Tk):
             self.e_pre.delete(0, "end")
             self.e_pre.insert(0, os.path.normpath(path))
 
+    def _browse_log(self):
+        path = filedialog.askopenfilename(title="选择脚本日志文件",
+                                          filetypes=[("日志文件", "*.log"), ("文本文件", "*.txt"),
+                                                     ("所有文件", "*.*")])
+        if path:
+            self.e_log_file.delete(0, "end")
+            self.e_log_file.insert(0, os.path.normpath(path))
+
     def _split(self, text):
         return [x.strip() for x in text.replace("，", ",").split(",") if x.strip()]
 
@@ -1141,6 +1185,14 @@ class App(tk.Tk):
             p["pre_delay_sec"] = max(0, int(self.e_pre_delay.get()))
         except Exception:
             p["pre_delay_sec"] = 0
+        p["log_file"] = self.e_log_file.get().strip().strip('"')
+        p["log_encoding"] = (self.e_log_enc.get() or "auto").strip().lower()
+        p["daily_done_patterns"] = self._split(self.e_daily_done.get())
+        p["daily_pending_patterns"] = self._split(self.e_daily_pending.get())
+        p["stamina_patterns"] = self._split(self.e_stamina.get())
+        p.pop("done_patterns", None)
+        p.pop("fail_patterns", None)
+        p.pop("tail_lines", None)
         p["wait_mode"] = self.wait_var.get()
         p["game_processes"] = self._split(self.e_game.get())
         p["helper_processes"] = self._split(self.e_helper.get())
@@ -1289,7 +1341,9 @@ class App(tk.Tk):
 
     def _apply_parsed_to_edit(self, parsed):
         advanced_keys = {"args", "wait_mode", "game_processes", "helper_processes",
-                         "start_timeout_min", "notes", "pre_launcher", "pre_args", "pre_delay_sec"}
+                         "start_timeout_min", "notes", "pre_launcher", "pre_args", "pre_delay_sec",
+                         "log_file", "log_encoding", "daily_done_patterns",
+                         "daily_pending_patterns", "stamina_patterns"}
         if advanced_keys & set(parsed.keys()) and hasattr(self, "_adv_visible") and not self._adv_visible:
             self._toggle_advanced()
 
@@ -1310,6 +1364,17 @@ class App(tk.Tk):
         if "pre_delay_sec" in parsed and hasattr(self, "e_pre_delay"):
             self.e_pre_delay.delete(0, "end")
             self.e_pre_delay.insert(0, str(parsed["pre_delay_sec"]))
+        if "log_file" in parsed and hasattr(self, "e_log_file"):
+            _set_entry(self.e_log_file, parsed["log_file"])
+        if "log_encoding" in parsed and hasattr(self, "e_log_enc"):
+            enc = (parsed["log_encoding"] or "auto").strip().lower()
+            self.e_log_enc.set(enc if enc in ("auto", "gbk", "utf-8") else "auto")
+        if "daily_done_patterns" in parsed and hasattr(self, "e_daily_done"):
+            _set_entry(self.e_daily_done, ", ".join(parsed["daily_done_patterns"]))
+        if "daily_pending_patterns" in parsed and hasattr(self, "e_daily_pending"):
+            _set_entry(self.e_daily_pending, ", ".join(parsed["daily_pending_patterns"]))
+        if "stamina_patterns" in parsed and hasattr(self, "e_stamina"):
+            _set_entry(self.e_stamina, ", ".join(parsed["stamina_patterns"]))
         if "wait_mode" in parsed and hasattr(self, "wait_var"):
             self.wait_var.set(parsed["wait_mode"])
         if "game_processes" in parsed and hasattr(self, "e_game"):
@@ -1333,7 +1398,9 @@ class App(tk.Tk):
         self._add_fill_overrides = {}
         for k in ("name", "args", "wait_mode", "game_processes", "helper_processes",
                   "start_timeout_min", "notes", "doc_url",
-                  "pre_launcher", "pre_args", "pre_delay_sec"):
+                  "pre_launcher", "pre_args", "pre_delay_sec",
+                  "log_file", "log_encoding", "daily_done_patterns",
+                  "daily_pending_patterns", "stamina_patterns"):
             if k in parsed:
                 self._add_fill_overrides[k] = parsed[k]
 
@@ -2307,11 +2374,17 @@ class App(tk.Tk):
         self._update_global_run_bar()
 
     def _log_tag_for(self, msg):
+        if "[每日未完成]" in msg:
+            return "log_err"
+        if "[每日完成]" in msg:
+            return "log_gold"
+        if "[体力]" in msg:
+            return "log_blue"
         if any(k in msg for k in ("[跳过]", "[失败]", "未找到启动器", "未配置启动器", "配置不完整")):
             return "log_err"
         if "[警告]" in msg:
             return "log_warn"
-        if any(k in msg for k in ("[完成]", "全部任务执行完成")):
+        if ("==========" in msg) or ("────────" in msg) or ("任务结果 ·" in msg) or ("结果输出完毕" in msg):
             return "log_ok"
         return None
 

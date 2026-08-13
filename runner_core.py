@@ -25,6 +25,11 @@ try:
 except ImportError:
     _preset_catalog = None
 
+try:
+    import log_watcher as _log_watcher
+except ImportError:
+    _log_watcher = None
+
 # 让所有内部命令（tasklist/taskkill）不弹出黑色控制台窗口
 CREATE_NO_WINDOW = 0x08000000
 
@@ -251,12 +256,16 @@ class Runner:
         wait_mode = p.get("wait_mode", "game")
         helper_procs = p.get("helper_processes", [])
 
+        watcher = self._start_log_watcher(p)
+        tick = watcher.poll if watcher else None
+
         if wait_mode == "helper":
             # 等助手自己退出
             self._stage("waiting", "等待助手运行完成", **event_base)
             self._tlog("[等待] 等待助手运行完成并自动退出...")
-            self._wait_until_all_gone(helper_procs)
+            self._wait_until_all_gone(helper_procs, on_tick=tick)
             stopped = self._stopped()
+            self._report_task_result(p, watcher)
             # 收尾：脚本没帮忙关游戏时兜底关闭
             for gp in p.get("game_processes", []):
                 if _tasklist_running(gp):
@@ -270,15 +279,16 @@ class Runner:
         timeout_min = int(p.get("start_timeout_min", 15))
         self._stage("waiting_start", "等待游戏启动", **event_base)
         self._tlog("[等待] 游戏启动中（最多 %d 分钟）..." % timeout_min)
-        appeared = self._wait_until_any_appear(game_procs, timeout_min)
+        appeared = self._wait_until_any_appear(game_procs, timeout_min, on_tick=tick)
         stopped = self._stopped()
         if not stopped and not appeared:
             self._tlog("[提示] 超时未检测到游戏进程，可能本次无任务或已直接结束，继续下一步。")
         elif not stopped:
             self._stage("running", "游戏运行中，等待任务完成", **event_base)
             self._tlog("[运行] 游戏已启动，等待助手完成并关闭游戏...")
-            self._wait_until_all_gone(game_procs)
+            self._wait_until_all_gone(game_procs, on_tick=tick)
             stopped = self._stopped()
+        self._report_task_result(p, watcher)
         # 收尾：关闭助手进程
         for hp in helper_procs:
             _kill(hp, self._tlog)
@@ -324,25 +334,78 @@ class Runner:
                 return
             time.sleep(min(1.0, max(0.0, deadline - time.time())))
 
-    def _wait_until_any_appear(self, procs, timeout_min):
+    # ---------- 脚本日志监控（任务结果汇总） ----------
+
+    def _start_log_watcher(self, p):
+        """按插件配置启动日志监控；未配置或文件不可用时返回 None。"""
+        if not _log_watcher or not (p.get("log_file") or "").strip():
+            return None
+        watcher = _log_watcher.ScriptLogWatcher(
+            log_file=p.get("log_file"),
+            encoding=p.get("log_encoding", "auto"),
+            daily_done_patterns=p.get("daily_done_patterns") or [],
+            daily_pending_patterns=p.get("daily_pending_patterns") or [],
+            stamina_patterns=p.get("stamina_patterns") or [],
+        )
+        if watcher.start():
+            self._tlog("[日志] 正在监控脚本日志：%s" % watcher.path)
+            return watcher
+        self._tlog("[日志] 未找到日志文件：%s" % p.get("log_file"))
+        return None
+
+    def _report_task_result(self, p, watcher):
+        """脚本退出后输出任务结果：每日奖励完成/未完成 + 最新体力剩余。"""
+        if watcher is None:
+            return
+        result = watcher.finish()
+        name = p.get("name", p.get("id", "未知"))
+        self._tlog("──────── 任务结果 · %s ────────" % name)
+
+        self.log("  🎁 [每日完成] 每日奖励 · 已完成：")
+        if result["daily_done"]:
+            for line in result["daily_done"]:
+                self.log("    · %s" % line)
+        else:
+            self.log("    · 未捕捉到相关记录")
+
+        self.log("  ❌ [每日未完成] 每日奖励 · 未完成/未领取：")
+        if result["daily_pending"]:
+            for line in result["daily_pending"]:
+                self.log("    · %s" % line)
+        else:
+            self.log("    · 未捕捉到相关记录")
+
+        self.log("  ⚡ [体力] 剩余体力/理智：")
+        if result["stamina"]:
+            for line in result["stamina"]:
+                self.log("    · %s" % line)
+        else:
+            self.log("    · 未捕捉到相关记录")
+        self._tlog("──────── 结果输出完毕 ────────")
+
+    def _wait_until_any_appear(self, procs, timeout_min, on_tick=None):
         if not procs:
             return False
         deadline = time.time() + timeout_min * 60
         while time.time() < deadline:
             if self._stopped():
                 return False
+            if on_tick:
+                on_tick()
             for proc in procs:
                 if _tasklist_running(proc):
                     return True
             time.sleep(2)
         return False
 
-    def _wait_until_all_gone(self, procs):
+    def _wait_until_all_gone(self, procs, on_tick=None):
         if not procs:
             return
         while True:
             if self._stopped():
                 return
+            if on_tick:
+                on_tick()
             if not any(_tasklist_running(proc) for proc in procs):
                 return
             time.sleep(5)

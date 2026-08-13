@@ -30,6 +30,11 @@ _KEY_MAP = {
     "pre_launcher": {"前置程序", "pre_launcher", "前置", "前置启动", "先启动"},
     "pre_args": {"前置参数", "pre_args", "前置程序参数"},
     "pre_delay_sec": {"前置等待", "pre_delay_sec", "前置等待秒", "前置延迟"},
+    "log_file": {"日志文件", "log_file", "日志", "日志路径"},
+    "log_encoding": {"日志编码", "log_encoding", "编码"},
+    "daily_done_patterns": {"每日完成", "daily_done_patterns", "每日奖励完成", "已完成关键词"},
+    "daily_pending_patterns": {"每日未完成", "daily_pending_patterns", "未领取关键词", "未完成关键词"},
+    "stamina_patterns": {"体力关键词", "stamina_patterns", "理智关键词", "体力"},
     "wait_mode": {"等待模式", "wait_mode", "完成判定", "wait"},
     "game_processes": {"游戏进程", "game_processes", "游戏进程名"},
     "helper_processes": {"助手进程", "helper_processes", "助手进程名"},
@@ -112,7 +117,8 @@ def parse_quick_fill(text):
             fields["args"] = value.split() if value else []
         elif field == "pre_args":
             fields["pre_args"] = value.split() if value else []
-        elif field in ("game_processes", "helper_processes"):
+        elif field in ("game_processes", "helper_processes", "daily_done_patterns",
+                       "daily_pending_patterns", "stamina_patterns"):
             fields[field] = _split_list(value)
         elif field == "checklist_done":
             if value:
@@ -175,6 +181,15 @@ def export_plugin_to_text(plugin):
         if plugin.get("pre_args"):
             lines.append("前置参数: %s" % " ".join(plugin["pre_args"]))
         lines.append("前置等待: %s" % plugin.get("pre_delay_sec", 0))
+    if plugin.get("log_file"):
+        lines.append("日志文件: %s" % plugin["log_file"])
+        lines.append("日志编码: %s" % plugin.get("log_encoding", "auto"))
+        if plugin.get("daily_done_patterns"):
+            lines.append("每日完成: %s" % ", ".join(plugin["daily_done_patterns"]))
+        if plugin.get("daily_pending_patterns"):
+            lines.append("每日未完成: %s" % ", ".join(plugin["daily_pending_patterns"]))
+        if plugin.get("stamina_patterns"):
+            lines.append("体力关键词: %s" % ", ".join(plugin["stamina_patterns"]))
     if plugin.get("doc_url"):
         lines.append("文档: %s" % plugin["doc_url"])
     if plugin.get("notes"):

@@ -67,7 +67,7 @@ class TestRunnerSkip(unittest.TestCase):
         killed = []
 
         class StopWhileWaitingRunner(rc.Runner):
-            def _wait_until_all_gone(self, procs):
+            def _wait_until_all_gone(self, procs, on_tick=None):
                 stop.set()
 
         plugin = {
@@ -80,7 +80,7 @@ class TestRunnerSkip(unittest.TestCase):
             "start_timeout_min": 1,
         }
         runner = StopWhileWaitingRunner(lambda _line: None, stop)
-        runner._wait_until_any_appear = lambda _procs, _timeout: True
+        runner._wait_until_any_appear = lambda _procs, _timeout, on_tick=None: True
         with patch.object(rc.subprocess, "Popen"), patch.object(
                 rc, "_kill", side_effect=lambda name, _log, label="助手": killed.append((name, label))):
             result = runner._run_one(1, 1, plugin)
