@@ -1,6 +1,7 @@
 # 用户运行时数据（含本机路径与配置）
 settings.json
 plugins/
+logs/
 
 # Python 缓存与编译产物
 __pycache__/

@@ -22,10 +22,64 @@ import os
 import glob
 import re
 
+try:
+    import ctypes
+except Exception:
+    ctypes = None
+
 DEFAULT_ENCODINGS = ["utf-8", "gbk"]
 
 # 多字节编码一个字符最多占 3 个字节（utf-8 三字节序列 / gbk 双字节）
 MAX_INCOMPLETE_TAIL = 3
+
+if ctypes and os.name == "nt":
+    class _FILETIME(ctypes.Structure):
+        _fields_ = [("dwLowDateTime", ctypes.c_ulong),
+                    ("dwHighDateTime", ctypes.c_ulong)]
+
+    class _BY_HANDLE_FILE_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("dwFileAttributes", ctypes.c_ulong),
+            ("ftCreationTime", _FILETIME),
+            ("ftLastAccessTime", _FILETIME),
+            ("ftLastWriteTime", _FILETIME),
+            ("dwVolumeSerialNumber", ctypes.c_ulong),
+            ("nFileSizeHigh", ctypes.c_ulong),
+            ("nFileSizeLow", ctypes.c_ulong),
+            ("nNumberOfLinks", ctypes.c_ulong),
+            ("nFileIndexHigh", ctypes.c_ulong),
+            ("nFileIndexLow", ctypes.c_ulong),
+        ]
+
+
+def _file_identity(path):
+    """
+    Windows 下返回文件的身份标识 (卷序列号, 文件索引高, 低)。
+
+    同一路径被替换成新文件时索引必然变化，与创建时间戳精度无关；
+    失败（文件不存在等）返回 None。非 Windows 平台也返回 None。
+    """
+    if os.name != "nt" or not ctypes:
+        return None
+    GENERIC_READ = 0x80000000
+    FILE_SHARE_READ = 0x1
+    FILE_SHARE_WRITE = 0x2
+    FILE_SHARE_DELETE = 0x4
+    OPEN_EXISTING = 3
+    FILE_ATTRIBUTE_NORMAL = 0x80
+    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+    handle = ctypes.windll.kernel32.CreateFileW(
+        path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        None, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None)
+    if handle == INVALID_HANDLE_VALUE:
+        return None
+    try:
+        info = _BY_HANDLE_FILE_INFORMATION()
+        if not ctypes.windll.kernel32.GetFileInformationByHandle(handle, ctypes.byref(info)):
+            return None
+        return (info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow)
+    finally:
+        ctypes.windll.kernel32.CloseHandle(handle)
 
 
 def _decode_incremental(data, encodings):
@@ -103,9 +157,9 @@ class ScriptLogWatcher:
 
         self.path = None
         self._offset = 0
-        self._pending = b""    # 上次 poll 未解完的多字节尾部
-        self._partial = ""     # 上次 poll 未写完（无换行结尾）的半行
-        self._ctime_ns = None  # Windows 下用于识别「文件被替换成更大的新文件」
+        self._pending = b""     # 上次 poll 未解完的多字节尾部
+        self._partial = ""      # 上次 poll 未写完（无换行结尾）的半行
+        self._identity = None   # Windows 文件身份（卷序列号+文件索引），识别替换
         self._daily_done = []
         self._daily_pending = []
         self._stamina = []
@@ -137,14 +191,13 @@ class ScriptLogWatcher:
         self._offset = 0
         self._pending = b""
         self._partial = ""
-        self._ctime_ns = None
+        self._identity = None
         if self.path:
             try:
-                st = os.stat(self.path)
-                self._offset = st.st_size
-                self._ctime_ns = st.st_ctime_ns if os.name == "nt" else None
+                self._offset = os.path.getsize(self.path)
             except OSError:
                 self._offset = 0
+            self._identity = _file_identity(self.path)
         return self.path is not None
 
     def poll(self):
@@ -155,18 +208,19 @@ class ScriptLogWatcher:
         if not path:
             return
         try:
-            st = os.stat(path)
+            size = os.path.getsize(path)
         except OSError:
             return
-        size = st.st_size
-        ctime = st.st_ctime_ns if os.name == "nt" else None
-        if path != self.path or size < self._offset or (ctime is not None and ctime != self._ctime_ns):
+        identity = _file_identity(path)
+        if path != self.path or size < self._offset or (
+                self._identity is not None and identity is not None
+                and identity != self._identity):
             # 日志轮转：换文件/被替换/被清空（含新文件比旧 offset 更大的情况），从头读
             self.path = path
             self._offset = 0
             self._pending = b""
             self._partial = ""
-            self._ctime_ns = ctime
+            self._identity = identity
         if size <= self._offset:
             return
         try:

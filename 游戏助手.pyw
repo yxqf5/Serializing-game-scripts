@@ -41,6 +41,7 @@ from app_paths import data_dir, resource_path
 BASE_DIR = data_dir()
 PLUGIN_DIR = os.path.join(BASE_DIR, "plugins")
 SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
+LOG_DIR = os.path.join(BASE_DIR, "logs")
 APP_ICON_PNG = resource_path("assets", "icons", "app.png")
 APP_ICON_ICO = resource_path("assets", "icons", "app.ico")
 import runner_core
@@ -51,6 +52,7 @@ from preset_resolver import (
 )
 import preflight
 import quick_fill as qf
+import log_saver
 from ui_helpers import LogStore, clamp_window_bounds, elide_end, elide_middle, group_tagged_lines
 
 WAIT_MODE_LABELS = {
@@ -200,9 +202,13 @@ class App(tk.Tk):
         self._drag_target = None
         self._tooltip_win = None
         self._tooltip_job = None
+        self._run_started_at = None   # 本轮运行开始时间（自动保存日志用）
+        self._run_tasks = []          # 本轮每个游戏的执行结果 [(name, result)]
 
         self.configure(bg=self.t["bg"])
         os.makedirs(PLUGIN_DIR, exist_ok=True)
+        log_saver.cleanup_old_logs(
+            LOG_DIR, log_saver.retention_days(self.settings.get("log_retention", "month")))
         self._build_shell()
         self.reload()
         if not self.settings.get("first_run_done"):
@@ -612,6 +618,8 @@ class App(tk.Tk):
             head, "□ 专注", self._toggle_log_focus, compact=True,
         )
         self.log_focus_btn.pack(side="right", padx=(6, 0))
+        self._button(head, "导入", self._import_log, compact=True).pack(side="right", padx=(6, 0))
+        self._button(head, "目录", self._open_log_dir, compact=True).pack(side="right", padx=(6, 0))
         self._button(head, "导出", self._export_log, compact=True).pack(side="right", padx=(6, 0))
         self._button(head, "清空", self._clear_log, compact=True).pack(side="right", padx=(6, 0))
         self._button(head, "复制", self._copy_log, compact=True).pack(side="right", padx=(6, 0))
@@ -1480,6 +1488,37 @@ class App(tk.Tk):
         tk.Label(wrap, text="提示：若觉得字体偏小或偏大，调整字号即可；高分屏已自动做清晰化处理。",
                  bg=t["bg"], fg=t["sub"], font=F(9)).pack(anchor="w", pady=(10, 0))
 
+        # 日志自动保存
+        tk.Label(wrap, text="日志自动保存", bg=t["bg"], fg=t["fg"], font=F(13, True)).pack(
+            anchor="w", pady=(18, 2))
+        tk.Label(wrap,
+                 text="每次运行结束自动保存到 logs\\YYYY-MM-DD.md，一天多次运行用分割线隔开；"
+                      "超过保留期的旧日志在启动/保存时自动清理。",
+                 bg=t["bg"], fg=t["sub"], font=F(9), justify="left",
+                 wraplength=720).pack(anchor="w", pady=(0, 6))
+        retention_row = tk.Frame(wrap, bg=t["bg"]); retention_row.pack(fill="x")
+        self.retention_var = tk.StringVar(value=self.settings.get("log_retention", "month"))
+        retention_opts = [
+            ("week", "保留最近一周"),
+            ("month", "保留最近一个月"),
+            ("forever", "不清理，一直保存"),
+        ]
+        for value, label in retention_opts:
+            tk.Radiobutton(retention_row, text=label, variable=self.retention_var, value=value,
+                           bg=t["bg"], fg=t["fg"], selectcolor=t["panel"],
+                           activebackground=t["bg"], activeforeground=t["accent"],
+                           font=F(10), command=self._apply_log_retention).pack(side="left", padx=(0, 18))
+        self._button(wrap, "打开日志目录", self._open_log_dir, compact=True).pack(anchor="w", pady=(10, 0))
+
+    def _apply_log_retention(self):
+        value = self.retention_var.get()
+        self.settings["log_retention"] = value
+        save_settings(self.settings)
+        removed = log_saver.cleanup_old_logs(
+            LOG_DIR, log_saver.retention_days(value))
+        if removed:
+            self._enqueue_log("已按新保留策略清理 %d 个过期日志文件。" % removed, level="info")
+
     def _apply_font(self):
         global _FAMILY, _SCALE
         _FAMILY = self.font_var.get()
@@ -2320,6 +2359,8 @@ class App(tk.Tk):
         self._clear_log(confirm=False)
         self.stop_event.clear()
         self.running = True
+        self._run_started_at = datetime.datetime.now()
+        self._run_tasks = []
         self.run_state = {
             "state": "running", "index": 0, "total": len(active),
             "name": "", "message": "正在启动串行任务", "result": None,
@@ -2368,6 +2409,7 @@ class App(tk.Tk):
                                   message=event.get("message", "运行中"))
         elif kind == "task_finished":
             labels = {"completed": "已完成", "skipped": "已跳过", "failed": "启动失败", "stopped": "已停止"}
+            self._run_tasks.append((event.get("name", ""), event.get("result", "")))
             self.run_state.update(index=event.get("index", 0), total=event.get("total", 0),
                                   name=event.get("name", ""),
                                   message=labels.get(event.get("result"), "已结束"))
@@ -2400,6 +2442,9 @@ class App(tk.Tk):
         if "[警告]" in msg:
             return "log_warn"
         if ("==========" in msg) or ("────────" in msg) or ("任务结果 ·" in msg) or ("结果输出完毕" in msg):
+            return "log_ok"
+        if msg.startswith(("# ", "## ", "### ")) or msg.startswith("```"):
+            # 导入的 md 日志：标题与代码块围栏用主题绿显示
             return "log_ok"
         return None
 
@@ -2554,11 +2599,107 @@ class App(tk.Tk):
             self.running = False
             if self.run_state.get("state") not in ("finished",):
                 self.run_state.update(state="finished", message="本轮任务已结束")
+            self._save_run_log()
             self._refresh_run_buttons()
 
         pending = not self.log_queue.empty() or not self.ui_queue.empty()
         interval = 16 if pending else (30 if self._preflight_busy else 80)
         self.after(interval, self._drain_log)
+
+    # ---------------- 日志自动保存 / 导入查看 ----------------
+
+    def _save_run_log(self):
+        """本轮运行结束后追加保存到今天的 md 文件，并按保留策略清理过期文件。"""
+        if self._run_started_at is None:
+            return
+        try:
+            lines = [text for text, _ in self.log_store.lines]
+            result = self.run_state.get("result") or "completed"
+            end_dt = datetime.datetime.now()
+            record_no = log_saver.today_record_count(LOG_DIR, now=end_dt) + 1
+            record = log_saver.build_run_markdown(
+                record_no, self._run_started_at, end_dt, result, self._run_tasks, lines)
+            path, _ = log_saver.append_run_record(LOG_DIR, record, now=end_dt)
+            removed = log_saver.cleanup_old_logs(
+                LOG_DIR, log_saver.retention_days(self.settings.get("log_retention", "month")))
+            self._enqueue_log("日志已自动保存：%s（今天第 %d 次运行%s）" % (
+                os.path.basename(path), record_no,
+                "，已清理 %d 个过期文件" % removed if removed else ""))
+        except Exception as e:
+            self._enqueue_log("自动保存日志失败：%s" % e, level="error")
+        finally:
+            self._run_started_at = None
+
+    def _open_log_dir(self):
+        try:
+            os.makedirs(LOG_DIR, exist_ok=True)
+            os.startfile(LOG_DIR)
+        except OSError as e:
+            messagebox.showerror("打开失败", str(e), parent=self)
+
+    def _import_log(self):
+        path = filedialog.askopenfilename(
+            title="导入日志文件",
+            filetypes=[("Markdown/日志", "*.md *.txt *.log"), ("所有文件", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8-sig") as f:
+                text = f.read()
+        except (UnicodeDecodeError, OSError):
+            try:
+                with open(path, "r", encoding="gbk", errors="replace") as f:
+                    text = f.read()
+            except OSError as e:
+                messagebox.showerror("导入失败", str(e), parent=self)
+                return
+        self._show_log_viewer(os.path.basename(path), text)
+
+    def _show_log_viewer(self, title, text):
+        """独立只读窗口展示导入的日志，保留按级别的着色。"""
+        t = self.t
+        win = tk.Toplevel(self)
+        win.title("日志查看 · %s" % title)
+        win.configure(bg=t["bg"])
+        win.geometry("980x640")
+        win.minsize(640, 420)
+        win.transient(self)
+
+        head = tk.Frame(win, bg=t["bg"]); head.pack(fill="x", padx=14, pady=(12, 8))
+        tk.Label(head, text=title, bg=t["bg"], fg=t["fg"], font=F(12, True)).pack(side="left")
+        self._button(head, "复制全部", lambda: self._viewer_copy(win), compact=True).pack(
+            side="right", padx=(6, 0))
+        self._button(head, "关闭", win.destroy, compact=True).pack(side="right", padx=(6, 0))
+
+        body = tk.Frame(win, bg=t["log_bg"], highlightthickness=1, highlightbackground=t["line"])
+        body.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+        txt = tk.Text(body, bg=t["log_bg"], fg=t["log_fg"], insertbackground=t["fg"],
+                      font=("Consolas", 11), relief="flat", padx=12, pady=10,
+                      highlightthickness=0, wrap="none")
+        sb = ttk.Scrollbar(body, orient="vertical", command=txt.yview, style="Vert.TScrollbar")
+        txt.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        txt.pack(side="left", fill="both", expand=True)
+        win._viewer_txt = txt
+
+        for tag, fg in (("log_err", t["err"]), ("log_warn", t["warn"]),
+                        ("log_gold", t["log_gold"]), ("log_blue", t["log_blue"]),
+                        ("log_ok", t["ok"])):
+            txt.tag_configure(tag, foreground=fg)
+        for tag, payload in group_tagged_lines(text.splitlines(), self._log_tag_for):
+            txt.insert("end", payload, tag or ())
+        txt.configure(state="disabled")
+        win.after(1, lambda: win.focus_set())
+
+    def _viewer_copy(self, win):
+        txt = getattr(win, "_viewer_txt", None)
+        if not txt or not txt.winfo_exists():
+            return
+        text = txt.get("1.0", "end-1c")
+        if text:
+            self.clipboard_clear()
+            self.clipboard_append(text)
 
 
 HELP_TEXT = """欢迎使用「游戏串行一键长草助手」
@@ -2586,6 +2727,10 @@ HELP_TEXT = """欢迎使用「游戏串行一键长草助手」
 运行日志
   • 拖动游戏队列与日志之间的分隔条，可自由调整日志高度。
   • 点「专注」让日志铺满右侧内容区；再次点击返回。
+  • 每次运行结束自动保存到 logs\\YYYY-MM-DD.md（一天多次运行用分割线隔开），
+    设置页可调整保留时长：最近一周 / 最近一个月 / 不清理。
+  • 「导入」可打开保存的 md 日志或任意文本日志，在独立窗口查看；
+    「目录」直接打开日志文件夹。
   • 向上滚动会暂停自动跟随，点「跟随最新」即可恢复。
   • 支持复制、清空和导出；界面最多保留最近 10000 行。
 
