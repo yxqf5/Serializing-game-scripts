@@ -2,6 +2,7 @@
 settings.json
 plugins/
 logs/
+daily_state.json
 
 # Python 缓存与编译产物
 __pycache__/

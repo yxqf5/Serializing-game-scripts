@@ -11,6 +11,7 @@
 """
 
 import os
+import json
 import time
 import subprocess
 import datetime
@@ -47,6 +48,87 @@ LEVEL_BLUE = "blue"
 TASK_COMPLETED = "completed"
 TASK_INCOMPLETE = "incomplete"
 TASK_UNKNOWN = "unknown"
+
+# 游戏服务器每日重置时刻（凌晨 4 点）：4 点前属于上一个服务器日
+DAILY_RESET_HOUR = 4
+
+
+def server_day(dt):
+    """游戏服务器日：以凌晨 4 点为界，4 点前属于上一个自然日。"""
+    return (dt - datetime.timedelta(hours=DAILY_RESET_HOUR)).date()
+
+
+def resolve_daily_repeat(task_status, last_done_dt, now_dt):
+    """同一服务器日内已完成过的任务再次运行时，「未完成」降级为「已完成」。
+
+    返回 (status, repeated)。白天领取过每日奖励后，当天再跑一次，
+    脚本检测不到可领取内容会报「未领取」——这是预期现象，不是失败。
+
+    返回值：
+      status    调整后的任务状态（仅 TASK_INCOMPLETE 可能被降级）
+      repeated  是否发生了同日重复降级（界面据此改用 ℹ️ 措辞而非 ❌ 报警）
+    """
+    if task_status != TASK_INCOMPLETE or last_done_dt is None:
+        return task_status, False
+    if server_day(last_done_dt) == server_day(now_dt):
+        return TASK_COMPLETED, True
+    return task_status, False
+
+
+class DailyDoneState:
+    """记录每个游戏最近一次判定「已完成」的时间，JSON 持久化（跨重启）。
+
+    path 为 None 时仅保存在内存中（测试用），不落盘。
+    """
+
+    def __init__(self, path=None):
+        self.path = path
+        self._done = {}
+        self._load()
+
+    def _load(self):
+        if not self.path:
+            return
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            games = data.get("games") if isinstance(data, dict) else None
+            if isinstance(games, dict):
+                self._done = {str(k): v for k, v in games.items()
+                              if isinstance(v, str)}
+        except Exception:
+            self._done = {}
+
+    def last_done(self, key):
+        """返回该游戏最近一次完成时间（datetime）；无记录/损坏返回 None。"""
+        raw = self._done.get(str(key))
+        if not raw:
+            return None
+        try:
+            return datetime.datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+
+    def mark_done(self, key, dt=None):
+        self._done[str(key)] = (dt or datetime.datetime.now()).isoformat(
+            timespec="seconds")
+        self._save()
+
+    def _save(self):
+        if not self.path:
+            return
+        tmp = "%s.tmp" % self.path
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"version": 1, "games": self._done}, f,
+                          ensure_ascii=False, indent=1)
+            os.replace(tmp, self.path)
+        except Exception:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
 
 
 def _func_accepts_kwarg(func, name):
@@ -181,7 +263,8 @@ def build_pre_cmd(pre, pre_args, method="explorer"):
 
 
 class Runner:
-    def __init__(self, log_func, stop_event=None, event_func=None, settle_sec=1.0):
+    def __init__(self, log_func, stop_event=None, event_func=None, settle_sec=1.0,
+                 daily_state_file=None):
         self.log = log_func
         self.stop_event = stop_event
         self.event_func = event_func
@@ -189,6 +272,8 @@ class Runner:
         self.settle_sec = max(0.0, float(settle_sec))
         self._log_accepts_level = _func_accepts_kwarg(log_func, "level")
         self._last_task_status = None
+        # 同服务器日重复运行判定所需的完成记录（不传则仅内存，测试用）
+        self.daily_state = DailyDoneState(daily_state_file)
 
     def _emit(self, event_type, **payload):
         """发送结构化运行事件；界面回调失败不能打断串行任务。"""
@@ -493,6 +578,8 @@ class Runner:
             else:
                 status = TASK_UNKNOWN
 
+        status, repeated = self._apply_daily_repeat(p, status)
+
         done_lines = result.get("daily_done") or []
         self._tlog("──────── 任务结果 · %s ────────" % name, level=LEVEL_OK)
         if status == TASK_COMPLETED and done_lines and (result.get("daily_pending") or []):
@@ -513,6 +600,15 @@ class Runner:
                     self._log("    · （匹配行过多，仅显示最新 %d 条）" % watcher.max_per_category,
                               level=LEVEL_WARN)
                 continue
+            if key == "daily_pending" and repeated:
+                # 同一服务器日内已完成过：脚本此时必然无可领取内容，
+                # 「未领取」是预期现象，用 ℹ️ 说明代替红色 ❌ 报警。
+                self._log("  ℹ️ [当日已完成] 今天 %02d:00 重置后已成功完成过每日，"
+                          "本次未再匹配到领取记录，不计为未完成：" % DAILY_RESET_HOUR,
+                          level=LEVEL_WARN)
+                for line in lines:
+                    self._log("    · %s" % line, level=LEVEL_WARN)
+                continue
             self._log(title, level=level)
             for line in lines:
                 self._log("    · %s" % line, level=level)
@@ -521,6 +617,25 @@ class Runner:
                           level=level)
         self._tlog("──────── 结果输出完毕 ────────", level=LEVEL_OK)
         return status
+
+    def _apply_daily_repeat(self, p, status):
+        """记录/查询同服务器日完成状态：当天已完成的游戏再跑不再报未完成。
+
+        判定为已完成时记录时间；判定为未完成但本服务器日（凌晨 4 点起）
+        已完成过时，降级为已完成并标记 repeated，让调用方用 ℹ️ 措辞输出。
+        """
+        if status not in (TASK_COMPLETED, TASK_INCOMPLETE):
+            return status, False
+        key = p.get("id") or p.get("name") or "未知"
+        now = datetime.datetime.now()
+        if status == TASK_COMPLETED:
+            self.daily_state.mark_done(key, now)
+            return status, False
+        status2, repeated = resolve_daily_repeat(
+            status, self.daily_state.last_done(key), now)
+        if repeated:
+            self.daily_state.mark_done(key, now)
+        return status2, repeated
 
     def _log_task_final(self, name, task_status, log_configured):
         """输出每个游戏脚本的最终结论：已完成 / 未完成（或无法判断）。"""

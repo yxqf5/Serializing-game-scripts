@@ -28,7 +28,8 @@ _RESULT_LABELS = {
     "failed": "启动失败",
     "skipped": "已跳过",
 }
-_TASK_MARKS = {"completed": "✅", "skipped": "⏭", "failed": "❌", "stopped": "⏹"}
+_TASK_MARKS = {"completed": "✅", "incomplete": "❌", "unknown": "⚠️",
+               "skipped": "⏭", "failed": "❌", "stopped": "⏹"}
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\.md$")
 

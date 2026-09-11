@@ -221,12 +221,51 @@ class TestRunnerLogReporting(unittest.TestCase):
                 FakeWatcher({"daily_done": ["任务完成"], "daily_pending": [],
                              "stamina": [], "truncated": {}})),
             rc.TASK_COMPLETED)
+        # 新建 Runner：同服务器日降级会记住上一次的完成记录，需隔离
+        runner2 = rc.Runner(lambda msg, level=None: None, settle_sec=0)
         self.assertEqual(
-            runner._report_task_result(
+            runner2._report_task_result(
                 {"name": "测试游戏", "daily_done_patterns": ["完成"],
                  "daily_pending_patterns": ["失败"]},
                 FakeWatcher({"daily_done": [], "daily_pending": [],
                              "stamina": [], "truncated": {}})),
+            rc.TASK_INCOMPLETE)
+
+    def test_report_result_same_day_repeat_suppressed(self):
+        """同服务器日内已完成过的游戏再次运行，「未完成」降级为已完成。"""
+        logs = []
+        runner = rc.Runner(lambda msg, level=None: logs.append((msg, level)), settle_sec=0)
+        plugin = {"name": "测试游戏", "daily_done_patterns": ["完成"],
+                  "daily_pending_patterns": ["失败"]}
+        self.assertEqual(
+            runner._report_task_result(plugin,
+                                       FakeWatcher({"daily_done": ["任务完成"],
+                                                    "daily_pending": [],
+                                                    "stamina": [], "truncated": {}})),
+            rc.TASK_COMPLETED)
+        status = runner._report_task_result(
+            plugin,
+            FakeWatcher({"daily_done": [], "daily_pending": ["未领取"],
+                         "stamina": [], "truncated": {}}))
+        self.assertEqual(status, rc.TASK_COMPLETED)
+        texts = [m for m, _ in logs]
+        self.assertTrue(any("[当日已完成]" in m for m in texts))
+        self.assertFalse(any("[每日未完成]" in m for m in texts))
+
+    def test_report_result_other_plugin_not_suppressed(self):
+        """同日降级只作用于已完成过的那个游戏，其他游戏照常判定。"""
+        runner = rc.Runner(lambda msg, level=None: None, settle_sec=0)
+        done = {"name": "游戏A", "daily_done_patterns": ["完成"]}
+        pending = {"name": "游戏B", "daily_done_patterns": ["完成"],
+                   "daily_pending_patterns": ["失败"]}
+        runner._report_task_result(done, FakeWatcher({"daily_done": ["任务完成"],
+                                                      "daily_pending": [],
+                                                      "stamina": [], "truncated": {}}))
+        self.assertEqual(
+            runner._report_task_result(pending,
+                                       FakeWatcher({"daily_done": [],
+                                                    "daily_pending": [],
+                                                    "stamina": [], "truncated": {}})),
             rc.TASK_INCOMPLETE)
 
     def test_report_result_omits_empty_category_noise(self):

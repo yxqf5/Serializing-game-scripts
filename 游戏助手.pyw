@@ -42,6 +42,8 @@ BASE_DIR = data_dir()
 PLUGIN_DIR = os.path.join(BASE_DIR, "plugins")
 SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
 LOG_DIR = os.path.join(BASE_DIR, "logs")
+# 各游戏最近一次判定「已完成」的时间（同服务器日重复运行判重用）
+DAILY_STATE_FILE = os.path.join(BASE_DIR, "daily_state.json")
 APP_ICON_PNG = resource_path("assets", "icons", "app.png")
 APP_ICON_ICO = resource_path("assets", "icons", "app.ico")
 import runner_core
@@ -2423,7 +2425,9 @@ class App(tk.Tk):
         self._refresh_run_buttons()
 
         def worker():
-            runner = runner_core.Runner(self._enqueue_log, self.stop_event, self._enqueue_run_event)
+            runner = runner_core.Runner(self._enqueue_log, self.stop_event,
+                                        self._enqueue_run_event,
+                                        daily_state_file=DAILY_STATE_FILE)
             try:
                 runner.run_all(active)
             except Exception as e:
@@ -2464,7 +2468,12 @@ class App(tk.Tk):
                                   message=event.get("message", "运行中"))
         elif kind == "task_finished":
             labels = {"completed": "已完成", "skipped": "已跳过", "failed": "启动失败", "stopped": "已停止"}
-            self._run_tasks.append((event.get("name", ""), event.get("result", "")))
+            # md 日志摘要用关键词判定结果（task_status）而非脚本是否跑完
+            # （result），否则「脚本正常跑完但每日未完成」会在摘要里显示 ✅。
+            stored = event.get("result", "")
+            if stored == "completed":
+                stored = event.get("task_status") or stored
+            self._run_tasks.append((event.get("name", ""), stored))
             self.run_state.update(index=event.get("index", 0), total=event.get("total", 0),
                                   name=event.get("name", ""),
                                   message=labels.get(event.get("result"), "已结束"))
