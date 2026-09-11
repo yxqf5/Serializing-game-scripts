@@ -33,7 +33,7 @@ if os.name == "nt" and ctypes:
         pass
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, font as tkfont
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from app_paths import data_dir, resource_path
@@ -168,7 +168,7 @@ class App(tk.Tk):
             pass
 
         # 原生窗口（任务栏 / 最小化 / 最大化均正常）+ 深色标题栏
-        self.minsize(940, 660)
+        self.minsize(self._px(940), self._px(660))
         self._window_save_job = None
         self._settings_save_job = None
         self._restoring_window = True
@@ -419,7 +419,7 @@ class App(tk.Tk):
         main = tk.Frame(self, bg=t["bg"])
         main.pack(fill="both", expand=True)
 
-        self.sidebar = tk.Frame(main, bg=t["panel"], width=212)
+        self.sidebar = tk.Frame(main, bg=t["panel"], width=self._sidebar_width())
         self.sidebar.pack(side="left", fill="y")
         self.sidebar.pack_propagate(False)
 
@@ -434,7 +434,7 @@ class App(tk.Tk):
         box = tk.Frame(logo, bg=t["panel"]); box.pack(side="left")
         tk.Label(box, text="一键长草", bg=t["panel"], fg=t["fg"], font=F(16, True)).pack(anchor="w")
         tk.Label(box, text="SERIAL RUNNER", bg=t["panel"], fg=t["sub"],
-                 font=("Consolas", 8)).pack(anchor="w")
+                 font=("Consolas", max(8, int(round(8 * _SCALE))))).pack(anchor="w")
 
         self.nav_items = {}
         self._nav("home", "主页", "▶")
@@ -456,9 +456,27 @@ class App(tk.Tk):
         self.content.pack(side="top", fill="both", expand=True)
         self._build_global_run_bar(body)
 
+    def _px(self, v):
+        """把按 96 DPI / 标准字号设计的固定像素尺寸换算到当前环境。"""
+        try:
+            dpi = self.winfo_fpixels("1i")
+        except Exception:
+            dpi = 96.0
+        return max(int(v), int(round(v * _SCALE * dpi / 96.0)))
+
+    def _sidebar_width(self):
+        """按当前字体实测侧栏所需宽度，高分屏/大字号下文字不再被裁剪。"""
+        nav = tkfont.Font(font=F(12, True))
+        logo = tkfont.Font(font=F(16, True))
+        admin = tkfont.Font(font=F(9))
+        w_nav = nav.measure("  ?   使用帮助") + 12 * 2 + 4 + 8 * 2
+        w_logo = 40 + 10 + logo.measure("一键长草") + 20 * 2
+        w_admin = admin.measure("● 非管理员") + 20 * 2
+        return max(212, w_nav, w_logo, w_admin)
+
     def _build_global_run_bar(self, parent):
         t = self.t
-        bar = tk.Frame(parent, bg=t["panel"], height=72,
+        bar = tk.Frame(parent, bg=t["panel"], height=self._px(72),
                        highlightthickness=1, highlightbackground=t["line"])
         bar.pack(side="bottom", fill="x")
         bar.pack_propagate(False)
@@ -474,14 +492,14 @@ class App(tk.Tk):
                                           fg=t["sub"], font=F(9), anchor="w")
         self.global_run_detail.pack(side="left", fill="x", expand=True, padx=(5, 0))
 
-        stop_slot = tk.Frame(bar, bg=t["panel"], width=148, height=50)
+        stop_slot = tk.Frame(bar, bg=t["panel"], width=self._px(148), height=self._px(50))
         stop_slot.pack(side="right", padx=(8, 16), pady=10)
         stop_slot.pack_propagate(False)
         self.global_stop_btn = self._button(stop_slot, "■ 结束运行", self.stop_run, danger=True)
         self.global_stop_btn.config(font=F(12, True), padx=12, pady=8)
         self.global_stop_btn.pack(fill="both", expand=True)
 
-        start_slot = tk.Frame(bar, bg=t["panel"], width=148, height=50)
+        start_slot = tk.Frame(bar, bg=t["panel"], width=self._px(148), height=self._px(50))
         start_slot.pack(side="right", padx=(8, 0), pady=10)
         start_slot.pack_propagate(False)
         self.global_start_btn = self._button(start_slot, "▶ 开始运行", self.start_run, primary=True)
@@ -489,7 +507,8 @@ class App(tk.Tk):
         self.global_start_btn.pack(fill="both", expand=True)
         self.global_progress = ttk.Progressbar(bar, orient="horizontal", mode="determinate", length=78,
                                                style="Run.Horizontal.TProgressbar")
-        self.global_progress.pack(side="right", padx=(8, 0), pady=29)
+        self.global_progress.pack(side="right", padx=(8, 0),
+                                  pady=max(10, (self._px(72) - 16) // 2))
         # 运行控件优先获得固定宽度，状态文字使用剩余空间。
         state.pack_forget()
         state.pack(side="left", fill="both", expand=True, padx=(18, 10), pady=7)
@@ -720,14 +739,27 @@ class App(tk.Tk):
         if not hasattr(self, "canvas") or not self.canvas.winfo_exists():
             return
         cw = self.canvas.winfo_width()
-        self.canvas.itemconfig("inner", width=cw)
-        self._sync_card_wraplength()
+        if cw and cw != getattr(self, "_canvas_w", None):
+            self._canvas_w = cw
+            self.canvas.itemconfig("inner", width=cw)
+        # 缩放窗口时 Configure 连续触发，合并到空闲时一次性处理。
+        if not getattr(self, "_wrap_sync_job", None):
+            self._wrap_sync_job = self.after_idle(self._do_sync_card_wraplength)
 
     def _sync_card_wraplength(self):
+        if not getattr(self, "_wrap_sync_job", None):
+            self._wrap_sync_job = self.after_idle(self._do_sync_card_wraplength)
+
+    def _do_sync_card_wraplength(self):
+        self._wrap_sync_job = None
         if not hasattr(self, "canvas") or not self.canvas.winfo_exists():
             return
-        max_chars = max(22, int((self.canvas.winfo_width() - 420) / 7))
-        name_chars = max(8, int((self.canvas.winfo_width() - 430) / 20))
+        cw = self.canvas.winfo_width()
+        if abs(cw - getattr(self, "_last_wrap_w", -10 ** 9)) < 8:
+            return
+        self._last_wrap_w = cw
+        max_chars = max(22, int((cw - 420) / 7))
+        name_chars = max(8, int((cw - 430) / 20))
         for refs in getattr(self, "_cards", []):
             name_lbl = refs.get("name")
             if name_lbl and name_lbl.winfo_exists():
@@ -743,6 +775,8 @@ class App(tk.Tk):
         for w in self.list_frame.winfo_children():
             w.destroy()
         self._cards = []
+        # 卡片全部重建，宽度标记一并失效，确保首轮省略号同步一定执行。
+        self._last_wrap_w = -10 ** 9
         t = self.t
         if not self.plugins:
             tk.Label(self.list_frame, text="还没有任何游戏，点击「＋ 添加游戏」开始。",
@@ -752,6 +786,21 @@ class App(tk.Tk):
         for idx, p in enumerate(self.plugins):
             self._card(idx, p)
         self._refresh_home_status()
+
+    def _path_exists(self, path, ttl=3.0):
+        """带短 TTL 缓存的存在性探测，勾选/刷新时不再每次都读盘。"""
+        if not path:
+            return False
+        now = time.monotonic()
+        cache = getattr(self, "_path_cache", None)
+        if cache is None:
+            cache = self._path_cache = {}
+        hit = cache.get(path)
+        if hit and now - hit[1] < ttl:
+            return hit[0]
+        ok = os.path.exists(path)
+        cache[path] = (ok, now)
+        return ok
 
     def _refresh_home_status(self):
         """更新主页顶部状态条：就绪 / 待办 / 路径无效 / 管理员。"""
@@ -773,7 +822,7 @@ class App(tk.Tk):
         pending_names = []
         for p in active:
             launcher = p.get("launcher", "")
-            if launcher and os.path.isfile(launcher):
+            if launcher and self._path_exists(launcher):
                 ok_ct += 1
             else:
                 bad_ct += 1
@@ -860,7 +909,7 @@ class App(tk.Tk):
         self._attach_tooltip(name_lbl, full_name)
 
         launcher = p.get("launcher", "")
-        ok = bool(launcher) and os.path.exists(launcher)
+        ok = self._path_exists(launcher)
         pending = pc.pending_checklist_count(p)
         status_text = "✓ 就绪" if ok else "✗ 路径无效"
         if pending:
@@ -908,10 +957,15 @@ class App(tk.Tk):
             if card.winfo_rooty() <= y <= card.winfo_rooty() + card.winfo_height():
                 target = i
                 break
+        if target == self._drag_target:
+            return
+        # 只更新高亮变化的两张卡，避免拖动时每像素全量重绘。
+        prev = self._drag_target
         self._drag_target = target
-        for i, refs in enumerate(self._cards):
-            refs["card"].config(highlightbackground=(
-                self.t["accent"] if i == target else self.t["line"]))
+        if prev is not None and 0 <= prev < len(self._cards):
+            self._cards[prev]["card"].config(highlightbackground=self.t["line"])
+        if 0 <= target < len(self._cards):
+            self._cards[target]["card"].config(highlightbackground=self.t["accent"])
 
     def _finish_card_drag(self, event=None):
         source, target = self._drag_from, self._drag_target
@@ -924,8 +978,9 @@ class App(tk.Tk):
         item = self.plugins.pop(source)
         self.plugins.insert(target, item)
         for order, plugin in enumerate(self.plugins, 1):
-            plugin["order"] = order
-            save_plugin(plugin)
+            if plugin.get("order") != order:
+                plugin["order"] = order
+                save_plugin(plugin)
         self._render_cards()
 
     def _attach_tooltip(self, widget, text):
@@ -2512,10 +2567,19 @@ class App(tk.Tk):
 
     def _update_log_toolbar(self):
         if hasattr(self, "log_follow_btn") and self.log_follow_btn.winfo_exists():
-            self.log_follow_btn.config(
-                text=("● 跟随最新" if self.log_follow else "○ 已暂停 · 跟随最新"),
-                fg=(self.t["ok"] if self.log_follow else self.t["warn"]),
-            )
+            text = ("● 跟随最新" if self.log_follow else "○ 已暂停 · 跟随最新")
+            if text != self.log_follow_btn.cget("text"):
+                self.log_follow_btn.config(
+                    text=text,
+                    fg=(self.t["ok"] if self.log_follow else self.t["warn"]),
+                )
+        if hasattr(self, "log_count_lbl") and self.log_count_lbl.winfo_exists():
+            # 刷屏时节流：行数至多每 200ms 刷新一次，避免每批日志都重绘标签。
+            if not getattr(self, "_log_count_job", None):
+                self._log_count_job = self.after(200, self._flush_log_count)
+
+    def _flush_log_count(self):
+        self._log_count_job = None
         if hasattr(self, "log_count_lbl") and self.log_count_lbl.winfo_exists():
             dropped = self.log_store.dropped_total
             suffix = (" · 已丢弃较早 %d 行" % dropped) if dropped else ""
@@ -2580,7 +2644,7 @@ class App(tk.Tk):
         lines = []
         done = False
         try:
-            while len(lines) < 500 and (time.perf_counter() - start) < 0.016:
+            while len(lines) < 1000 and (time.perf_counter() - start) < 0.020:
                 item = self.log_queue.get_nowait()
                 kind = item[0]
                 if kind == "__DONE__":
@@ -2603,7 +2667,9 @@ class App(tk.Tk):
             self._refresh_run_buttons()
 
         pending = not self.log_queue.empty() or not self.ui_queue.empty()
-        interval = 16 if pending else (30 if self._preflight_busy else 80)
+        # 33ms 节奏足够流畅（约 30 次/秒），比 16ms 明显降低重排版频率；
+        # 吞吐靠单次最多 1000 行补偿，刷屏时依旧跟得上。
+        interval = 33 if (pending or self._preflight_busy) else 80
         self.after(interval, self._drain_log)
 
     # ---------------- 日志自动保存 / 导入查看 ----------------
