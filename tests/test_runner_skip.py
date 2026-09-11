@@ -46,10 +46,12 @@ class TestRunnerSkip(unittest.TestCase):
         self.assertEqual(events[0]["type"], "queue_started")
         self.assertEqual(events[1]["type"], "task_started")
         self.assertEqual(events[1]["name"], "坏配置")
-        self.assertTrue(any(
-            event.get("type") == "task_finished" and event.get("result") == "skipped"
-            for event in events
-        ))
+        skipped_events = [
+            event for event in events
+            if event.get("type") == "task_finished" and event.get("result") == "skipped"
+        ]
+        self.assertTrue(skipped_events)
+        self.assertEqual(skipped_events[0].get("task_status"), rc.TASK_INCOMPLETE)
         self.assertEqual(events[-1]["type"], "queue_finished")
 
     def test_event_callback_failure_never_breaks_runner(self):
@@ -195,6 +197,7 @@ class TestRunnerLogReporting(unittest.TestCase):
         self.assertFalse(any("[每日未完成]" in m for m in texts))
         self.assertFalse(any("[体力]" in m for m in texts))
         self.assertTrue(any("[每日完成]" in m and lvl == "gold" for m, lvl in logs))
+        self.assertFalse(any("未捕捉到相关记录" in m for m in texts))
 
     def test_report_result_no_patterns_prints_nothing(self):
         logs = []
@@ -209,13 +212,86 @@ class TestRunnerLogReporting(unittest.TestCase):
         runner._report_task_result({"name": "测试游戏", "daily_done_patterns": ["完成"]}, w)
         self.assertGreaterEqual(w.polls, 1)
 
+    def test_report_result_returns_task_status(self):
+        """日志里只有完成行时应返回 completed，没有完成行时返回 incomplete。"""
+        runner = rc.Runner(lambda msg, level=None: None, settle_sec=0)
+        self.assertEqual(
+            runner._report_task_result(
+                {"name": "测试游戏", "daily_done_patterns": ["完成"]},
+                FakeWatcher({"daily_done": ["任务完成"], "daily_pending": [],
+                             "stamina": [], "truncated": {}})),
+            rc.TASK_COMPLETED)
+        self.assertEqual(
+            runner._report_task_result(
+                {"name": "测试游戏", "daily_done_patterns": ["完成"],
+                 "daily_pending_patterns": ["失败"]},
+                FakeWatcher({"daily_done": [], "daily_pending": [],
+                             "stamina": [], "truncated": {}})),
+            rc.TASK_INCOMPLETE)
+
+    def test_report_result_omits_empty_category_noise(self):
+        """已完成的游戏不再打印红色的「未捕捉到相关记录」行。"""
+        logs = []
+        runner = rc.Runner(lambda msg, level=None: logs.append((msg, level)), settle_sec=0)
+        runner._report_task_result(
+            {"name": "测试游戏", "daily_done_patterns": ["完成"],
+             "daily_pending_patterns": ["失败"]},
+            FakeWatcher({"daily_done": ["任务完成"], "daily_pending": [],
+                         "stamina": [], "truncated": {}}))
+        texts = [m for m, _ in logs]
+        self.assertTrue(any("[每日完成]" in m for m in texts))
+        self.assertFalse(any("[每日未完成]" in m for m in texts))
+        self.assertFalse(any("未捕捉到相关记录" in m for m in texts))
+
+    def test_report_result_done_with_recheck_pending_is_not_red(self):
+        """崩铁完成后复查出「未检测到奖励」时，不得再显示红色未完成标题。"""
+        logs = []
+        runner = rc.Runner(lambda msg, level=None: logs.append((msg, level)), settle_sec=0)
+        status = runner._report_task_result(
+            {"name": "崩铁", "daily_done_patterns": ["每日实训已完成"],
+             "daily_pending_patterns": ["未检测到每日实训奖励"]},
+            FakeWatcher({"daily_done": ["每日实训已完成"],
+                         "daily_pending": ["未检测到每日实训奖励"],
+                         "stamina": [], "truncated": {}}))
+        texts = [m for m, _ in logs]
+        self.assertEqual(status, rc.TASK_COMPLETED)
+        self.assertTrue(any("[每日完成]" in m for m in texts))
+        self.assertFalse(any("[每日未完成]" in m for m in texts))
+        self.assertTrue(any("[复查记录]" in m and lvl == "warn" for m, lvl in logs))
+
+    def test_log_task_final_prints_clear_conclusion(self):
+        """最终日志必须明确输出「已完成」或「未完成」。"""
+        logs = []
+        runner = rc.Runner(lambda msg, level=None: logs.append((msg, level)), settle_sec=0)
+        runner._log_task_final("原神", rc.TASK_COMPLETED, log_configured=True)
+        runner._log_task_final("崩铁", rc.TASK_INCOMPLETE, log_configured=True)
+        self.assertTrue(any("[任务完成] 原神 · 已完成" in m and lvl == "ok" for m, lvl in logs))
+        self.assertTrue(any("[任务未完成] 崩铁 · 未完成" in m and lvl == "error"
+                            for m, lvl in logs))
+
+    def test_log_daily_summary_one_glance(self):
+        """队列结束前输出蓝色分隔的每日完成汇总。"""
+        logs = []
+        runner = rc.Runner(lambda msg, level=None: logs.append((msg, level)), settle_sec=0)
+        runner._log_daily_summary([
+            ("绝区零", rc.TASK_COMPLETED),
+            ("原神", rc.TASK_COMPLETED),
+            ("崩铁", rc.TASK_INCOMPLETE),
+        ])
+        self.assertTrue(any("每日奖励完成情况汇总" in m and lvl == "blue" for m, lvl in logs))
+        self.assertTrue(any("✅ 已完成 · 原神" in m and lvl == "ok" for m, lvl in logs))
+        self.assertTrue(any("❌ 未完成 · 崩铁" in m and lvl == "error" for m, lvl in logs))
+        self.assertTrue(any("结论：完成 2 个，未完成 1 个" in m and lvl == "warn"
+                            for m, lvl in logs))
+
     def test_runner_logs_carry_structured_levels(self):
         """level 关键字传给支持它的 log 回调（旧回调仍可用）。"""
         logs = []
         runner = rc.Runner(lambda msg, level=None: logs.append((msg, level)), settle_sec=0)
         runner.run_all([{"name": "坏配置", "launcher": ""}])
         self.assertTrue(any(lvl == "error" and "[跳过]" in m for m, lvl in logs))
-        self.assertTrue(any(lvl == "ok" and "全部任务执行完成" in m for m, lvl in logs))
+        self.assertTrue(any(lvl == "warn" and "串行队列执行完毕" in m for m, lvl in logs))
+        self.assertTrue(any(lvl == "error" and "❌ 未完成 · 坏配置" in m for m, lvl in logs))
 
     def test_log_func_without_level_still_works(self):
         """只接受 msg 的旧回调不受影响。"""

@@ -71,6 +71,8 @@ class TestScriptLogWatcher(unittest.TestCase):
             # 体力只保留最新一条
             self.assertEqual(len(result["stamina"]), 1)
             self.assertIn("69/300", result["stamina"][0])
+            # 完成与失败关键词同时命中时按已完成处理（崩铁脚本的正常行为）
+            self.assertEqual(result["task_status"], lw.TASK_COMPLETED)
 
     def test_stamina_latest_wins_over_done(self):
         """体力行出现多次只留最新；先命中体力后命中其他分类互不干扰。"""
@@ -236,6 +238,41 @@ class TestScriptLogWatcher(unittest.TestCase):
             self.assertTrue(result["truncated"]["daily_done"])
             self.assertIn("第11次完成", result["daily_done"][-1])
             self.assertFalse(result["truncated"]["stamina"])
+
+class TestResolveTaskStatus(unittest.TestCase):
+    def test_no_patterns_unknown(self):
+        self.assertEqual(
+            lw.resolve_task_status([], [], done_configured=False, pending_configured=False),
+            lw.TASK_UNKNOWN)
+
+    def test_done_wins_when_both_hit(self):
+        """崩铁完成后会补打「未检测到奖励」，应判已完成。"""
+        self.assertEqual(
+            lw.resolve_task_status(["每日实训已完成"], ["未检测到每日实训奖励"],
+                                   done_configured=True, pending_configured=True),
+            lw.TASK_COMPLETED)
+
+    def test_done_configured_but_missing_is_incomplete(self):
+        self.assertEqual(
+            lw.resolve_task_status([], [], done_configured=True, pending_configured=True),
+            lw.TASK_INCOMPLETE)
+
+    def test_only_failure_configured_and_clean_is_completed(self):
+        """MaaEnd / OneDragon 只配失败关键词：没有失败行就是已完成。"""
+        self.assertEqual(
+            lw.resolve_task_status([], [], done_configured=False, pending_configured=True),
+            lw.TASK_COMPLETED)
+
+    def test_only_failure_configured_and_hit_is_incomplete(self):
+        self.assertEqual(
+            lw.resolve_task_status([], ["执行失败"],
+                                   done_configured=False, pending_configured=True),
+            lw.TASK_INCOMPLETE)
+
+    def test_done_only_missing_is_incomplete(self):
+        self.assertEqual(
+            lw.resolve_task_status([], [], done_configured=True, pending_configured=False),
+            lw.TASK_INCOMPLETE)
 
 
 if __name__ == "__main__":

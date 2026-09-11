@@ -15,7 +15,7 @@
                          stamina_patterns=["开拓力"])
     w.start()          # 记录起始位置
     w.poll()           # 等待期间周期性调用，增量读取
-    result = w.finish()# 返回 {"daily_done": [...], "daily_pending": [...], "stamina": [...]}
+    result = w.finish()# 返回 {"daily_done": [...], "daily_pending": [...], "stamina": [...], "task_status": "completed"}
 """
 
 import os
@@ -31,6 +31,11 @@ DEFAULT_ENCODINGS = ["utf-8", "gbk"]
 
 # 多字节编码一个字符最多占 3 个字节（utf-8 三字节序列 / gbk 双字节）
 MAX_INCOMPLETE_TAIL = 3
+
+# 预设任务完成状态（runner_core 据此输出「已完成 / 未完成」）
+TASK_COMPLETED = "completed"
+TASK_INCOMPLETE = "incomplete"
+TASK_UNKNOWN = "unknown"
 
 if ctypes and os.name == "nt":
     class _FILETIME(ctypes.Structure):
@@ -140,6 +145,31 @@ def _dedup_keep_order(lines):
             seen.add(line)
             out.append(line)
     return out
+
+
+def resolve_task_status(done_lines, pending_lines,
+                        done_configured=True, pending_configured=True):
+    """
+    根据提取到的完成/失败行，判断脚本预设任务是否完成。
+
+    规则（与各脚本实测日志约定保持一致）：
+    - 两类关键词都没配置：无法从日志判断，返回 unknown。
+    - 同时命中完成和失败：按已完成处理。崩铁 March7th 完成后会再次
+      检测奖励并打印「未检测到」，这不是真正的失败。
+    - 配置了完成关键词：只要没看到完成行，就视为未完成。
+    - 只配置了失败关键词（MaaEnd/OneDragon 等）：看到失败行才算未完成，
+      没有失败行视为已完成（这些脚本正常跑完不会写失败日志）。
+    """
+    if not done_configured and not pending_configured:
+        return TASK_UNKNOWN
+    if done_configured and done_lines:
+        return TASK_COMPLETED
+    if pending_configured and pending_lines:
+        return TASK_INCOMPLETE
+    if done_configured:
+        return TASK_INCOMPLETE
+    # 只配置了失败关键词，且没有命中失败行
+    return TASK_COMPLETED
 
 
 class ScriptLogWatcher:
@@ -274,7 +304,9 @@ class ScriptLogWatcher:
         返回本次运行提取的三类信息（每类去重后最多保留最新 max_per_category 条）。
 
         返回 dict：daily_done / daily_pending / stamina 为行列表，
-        truncated 为 {分类: bool}，标记该分类是否因超出上限被截断。
+        truncated 为 {分类: bool}，标记该分类是否因超出上限被截断；
+        task_status 为 completed / incomplete / unknown，供运行器输出
+        明确的「任务已完成 / 任务未完成」结论。
         """
         self._flush_tail()
         out = {}
@@ -290,4 +322,9 @@ class ScriptLogWatcher:
                 uniq = uniq[-self.max_per_category:]
             out[key] = uniq
         out["truncated"] = truncated
+        out["task_status"] = resolve_task_status(
+            out["daily_done"], out["daily_pending"],
+            done_configured=bool(self.daily_done_re),
+            pending_configured=bool(self.daily_pending_re),
+        )
         return out

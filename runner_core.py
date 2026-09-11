@@ -43,6 +43,12 @@ LEVEL_GOLD = "gold"
 LEVEL_BLUE = "blue"
 
 
+# 预设任务完成状态（与 log_watcher 的 task_status 对应）
+TASK_COMPLETED = "completed"
+TASK_INCOMPLETE = "incomplete"
+TASK_UNKNOWN = "unknown"
+
+
 def _func_accepts_kwarg(func, name):
     """判断 log 回调是否接受额外的 level 关键字参数（旧回调只有 msg 也能用）。"""
     try:
@@ -182,6 +188,7 @@ class Runner:
         # 任务结束后给脚本日志落盘留出的缓冲秒数（最终 poll 前等待）
         self.settle_sec = max(0.0, float(settle_sec))
         self._log_accepts_level = _func_accepts_kwarg(log_func, "level")
+        self._last_task_status = None
 
     def _emit(self, event_type, **payload):
         """发送结构化运行事件；界面回调失败不能打断串行任务。"""
@@ -233,6 +240,8 @@ class Runner:
     def run_all(self, plugins):
         """plugins：已按 order 排序、且只含 enabled 的插件 dict 列表。"""
         total = len(plugins)
+        incomplete = 0
+        summary_rows = []
         self._emit("queue_started", total=total)
         self._tlog("开始串行执行，共 %d 个游戏。" % total)
         self._log("")
@@ -244,17 +253,29 @@ class Runner:
             name = p.get("name", p.get("id", "未知"))
             self._emit("task_started", index=idx, total=total, name=name)
             result = self._run_one(idx, total, p)
-            self._emit("task_finished", index=idx, total=total, name=name, result=result)
+            task_status = getattr(self, "_last_task_status", None) or TASK_UNKNOWN
+            if result in ("failed", "skipped"):
+                task_status = TASK_INCOMPLETE
+            if task_status == TASK_INCOMPLETE:
+                incomplete += 1
+            summary_rows.append((name, task_status))
+            self._emit("task_finished", index=idx, total=total, name=name, result=result,
+                       task_status=task_status)
             self._log("")
             if result == "stopped":
                 self._tlog("已被用户中止。", level=LEVEL_WARN)
                 self._emit("queue_finished", result="stopped", total=total)
                 return
-        self._tlog("全部任务执行完成。", level=LEVEL_OK)
+        self._log_daily_summary(summary_rows)
+        if incomplete:
+            self._tlog("串行队列执行完毕：有 %d 个游戏任务未完成。" % incomplete, level=LEVEL_WARN)
+        else:
+            self._tlog("全部任务执行完成。", level=LEVEL_OK)
         self._emit("queue_finished", result="completed", total=total)
 
     def _run_one(self, idx, total, p):
         name = p.get("name", p.get("id", "未知"))
+        self._last_task_status = None
         self._tlog("========== (%d/%d) %s ==========" % (idx, total, name), level=LEVEL_OK)
         event_base = {"index": idx, "total": total, "name": name}
         self._stage("checking", "正在检查配置", **event_base)
@@ -286,6 +307,7 @@ class Runner:
             return "failed"
 
         wait_mode = p.get("wait_mode", "game")
+        log_configured = bool((p.get("log_file") or "").strip())
         helper_procs = p.get("helper_processes", [])
 
         watcher = self._start_log_watcher(p)
@@ -297,13 +319,14 @@ class Runner:
             self._tlog("[等待] 等待助手运行完成并自动退出...")
             self._wait_until_all_gone(helper_procs, on_tick=tick)
             stopped = self._stopped()
-            self._report_task_result(p, watcher)
+            task_status = self._report_task_result(p, watcher) or TASK_UNKNOWN
             # 收尾：脚本没帮忙关游戏时兜底关闭
             for gp in p.get("game_processes", []):
                 if _tasklist_running(gp):
                     _kill(gp, self._tlog, label="游戏")
             if not stopped:
-                self._tlog("[完成] %s" % name, level=LEVEL_OK)
+                self._log_task_final(name, task_status, log_configured)
+
             return "stopped" if stopped else "completed"
 
         # wait_mode == "game"
@@ -320,12 +343,17 @@ class Runner:
             self._tlog("[运行] 游戏已启动，等待助手完成并关闭游戏...")
             self._wait_until_all_gone(game_procs, on_tick=tick)
             stopped = self._stopped()
-        self._report_task_result(p, watcher)
+        task_status = self._report_task_result(p, watcher)
+        task_status = task_status or TASK_UNKNOWN
+        if not stopped and not appeared and task_status == TASK_UNKNOWN:
+            # 游戏进程从未出现，日志也无法给出结论：宁可报未完成，也不假装完成
+            task_status = TASK_INCOMPLETE
         # 收尾：关闭助手进程
         for hp in helper_procs:
             _kill(hp, self._tlog)
         if not stopped:
-            self._tlog("[完成] %s" % name, level=LEVEL_OK)
+            self._log_task_final(name, task_status, log_configured)
+
         return "stopped" if stopped else "completed"
 
     def _run_pre_launch(self, p, pre):
@@ -385,7 +413,7 @@ class Runner:
         self._tlog("[日志] 未找到日志文件：%s" % p.get("log_file"))
         return None
 
-    def _report_task_result(self, p, watcher):
+    def _report_task_result_legacy(self, p, watcher):
         """脚本退出后输出任务结果：每日奖励完成/未完成 + 最新体力剩余。
 
         只输出配置了提取关键词的分类；输出前等 settle_sec 让脚本最后几行
@@ -423,6 +451,120 @@ class Runner:
                 self._log("    · （匹配行过多，仅显示最新 %d 条）" % watcher.max_per_category,
                           level=level)
         self._tlog("──────── 结果输出完毕 ────────", level=LEVEL_OK)
+
+    def _report_task_result(self, p, watcher):
+        """脚本退出后汇总日志提取结果。
+
+        返回预设任务完成状态：TASK_COMPLETED / TASK_INCOMPLETE /
+        TASK_UNKNOWN；未启动日志监控时返回 None（由调用方按 unknown 处理）。
+
+        这里只输出实际匹配到的证据行，不再为每个未命中的分类打印
+        「未捕捉到相关记录」——旧逻辑会在已完成时同时打印红色未完成行，
+        用户无法一眼看出任务到底完成没有。最终结论由 _log_task_final 输出。
+        """
+        if watcher is None:
+            return None
+        if not self._stopped() and self.settle_sec > 0:
+            self._sleep_interruptible(self.settle_sec)
+        watcher.poll()  # 确保读完最后一截增量
+        result = watcher.finish()
+        name = p.get("name", p.get("id", "未知"))
+
+        sections = []
+        if p.get("daily_done_patterns"):
+            sections.append(("daily_done", "  🎁 [每日完成] 每日奖励 · 已完成：", LEVEL_GOLD))
+        if p.get("daily_pending_patterns"):
+            sections.append(("daily_pending", "  ❌ [每日未完成] 每日奖励 · 未完成/未领取：", LEVEL_ERROR))
+        if p.get("stamina_patterns"):
+            sections.append(("stamina", "  ⚡ [体力] 剩余体力/理智：", LEVEL_BLUE))
+        if not sections:
+            # 配了日志文件但没配任何提取关键词：无法判断，交给 _log_task_final 提示
+            return TASK_UNKNOWN
+
+        status = result.get("task_status")
+        if status not in (TASK_COMPLETED, TASK_INCOMPLETE, TASK_UNKNOWN):
+            if _log_watcher and hasattr(_log_watcher, "resolve_task_status"):
+                status = _log_watcher.resolve_task_status(
+                    result.get("daily_done") or [],
+                    result.get("daily_pending") or [],
+                    done_configured=bool(p.get("daily_done_patterns")),
+                    pending_configured=bool(p.get("daily_pending_patterns")),
+                )
+            else:
+                status = TASK_UNKNOWN
+
+        done_lines = result.get("daily_done") or []
+        self._tlog("──────── 任务结果 · %s ────────" % name, level=LEVEL_OK)
+        if status == TASK_COMPLETED and done_lines and (result.get("daily_pending") or []):
+            self._log("  ℹ️ [判定说明] 完成与未完成关键词都出现，按已完成处理（部分脚本完成后会复查奖励）。",
+                      level=LEVEL_WARN)
+        truncated = result.get("truncated", {})
+        for key, title, level in sections:
+            lines = result.get(key) or []
+            if not lines:
+                continue
+            if key == "daily_pending" and status == TASK_COMPLETED and done_lines:
+                # 崩铁等脚本完成后会再次检测奖励并打印「未检测到」；
+                # 这是复查记录，不是未完成，所以不再用红色 ❌ 显示。
+                self._log("  ℹ️ [复查记录] 完成后复查（不是未完成）：", level=LEVEL_WARN)
+                for line in lines:
+                    self._log("    · %s" % line, level=LEVEL_WARN)
+                if truncated.get(key):
+                    self._log("    · （匹配行过多，仅显示最新 %d 条）" % watcher.max_per_category,
+                              level=LEVEL_WARN)
+                continue
+            self._log(title, level=level)
+            for line in lines:
+                self._log("    · %s" % line, level=level)
+            if truncated.get(key):
+                self._log("    · （匹配行过多，仅显示最新 %d 条）" % watcher.max_per_category,
+                          level=level)
+        self._tlog("──────── 结果输出完毕 ────────", level=LEVEL_OK)
+        return status
+
+    def _log_task_final(self, name, task_status, log_configured):
+        """输出每个游戏脚本的最终结论：已完成 / 未完成（或无法判断）。"""
+        self._last_task_status = task_status
+        if task_status == TASK_COMPLETED:
+            self._tlog("[任务完成] %s · 已完成" % name, level=LEVEL_OK)
+        elif task_status == TASK_INCOMPLETE:
+            self._tlog("[任务未完成] %s · 未完成" % name, level=LEVEL_ERROR)
+        elif log_configured:
+            self._tlog("[提示] %s 已结束，但无法从脚本日志确认任务是否完成。" % name, level=LEVEL_WARN)
+        else:
+            self._tlog("[完成] %s" % name, level=LEVEL_OK)
+
+    def _log_daily_summary(self, rows):
+        """在队列结束前输出一眼可懂的每日完成情况汇总。"""
+        if not rows:
+            return
+        bar = "★━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        self._log("")
+        self._log(bar, level=LEVEL_BLUE)
+        self._log("  每日奖励完成情况汇总", level=LEVEL_BLUE)
+        self._log(bar, level=LEVEL_BLUE)
+
+        done = sum(1 for _, status in rows if status == TASK_COMPLETED)
+        incomplete = sum(1 for _, status in rows if status == TASK_INCOMPLETE)
+        unknown = len(rows) - done - incomplete
+        for name, status in rows:
+            if status == TASK_COMPLETED:
+                self._log("  ✅ 已完成 · %s" % name, level=LEVEL_OK)
+            elif status == TASK_INCOMPLETE:
+                self._log("  ❌ 未完成 · %s" % name, level=LEVEL_ERROR)
+            else:
+                self._log("  ⚠ 未能确认 · %s" % name, level=LEVEL_WARN)
+
+        self._log("  ──────────────────────────────────", level=LEVEL_BLUE)
+        parts = ["完成 %d 个" % done]
+        if incomplete:
+            parts.append("未完成 %d 个" % incomplete)
+        if unknown:
+            parts.append("未能确认 %d 个" % unknown)
+        level = LEVEL_OK if done == len(rows) else LEVEL_WARN
+        self._log("  结论：%s" % "，".join(parts), level=level)
+        self._log(bar, level=LEVEL_BLUE)
+        self._log("")
 
     def _wait_until_any_appear(self, procs, timeout_min, on_tick=None):
         if on_tick:

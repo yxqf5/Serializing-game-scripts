@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>模拟日志 · 有任务未完成</title>
+<style>
+  body { background: #0d0d0f; color: #f3f3f5; font-family: Consolas, "Microsoft YaHei UI", monospace; padding: 28px; }
+  h1 { color: #ff7a18; font-size: 19px; margin-bottom: 6px; }
+  p.hint { color: #8b8b93; font-size: 12px; margin-bottom: 14px; }
+  pre { background: #0a0a0c; border: 1px solid #2b2b32; padding: 20px; line-height: 1.65; font-size: 13px; white-space: pre-wrap; word-break: break-all; }
+  .info  { color: #d8d8de; }
+  .ok    { color: #3ad07f; }
+  .warn  { color: #ffc24b; }
+  .err   { color: #ff5b5b; }
+  .gold  { color: #ffd700; }
+  .blue  { color: #4da6ff; }
+</style>
+</head>
+<body>
+<h1>模拟日志 · 有任务未完成（橙黑主题实际配色）</h1>
+<p class="hint">绿色=完成，红色=未完成结论，金色=完成证据，蓝色=体力与汇总分割线，黄色=最终队列提示，灰色=普通日志。</p>
+<pre><span class="info">[10:47:23] 开始串行执行，共 5 个游戏。</span>
+<span class="info"></span>
+<span class="ok">[10:47:23] ========== (1/5) 绝区零 · OneDragon · 一条龙 ==========</span>
+<span class="info">[10:47:24] [启动] OneDragon-Launcher.exe -o --close-game</span>
+<span class="info">[10:47:24] [日志] 正在监控脚本日志：E:\Games\py\zzz\.log\log.txt</span>
+<span class="info">[10:47:24] [等待] 游戏启动中（最多 15 分钟）...</span>
+<span class="info">[10:47:38] [运行] 游戏已启动，等待助手完成并关闭游戏...</span>
+<span class="ok">[10:58:22] ──────── 任务结果 · 绝区零 · OneDragon · 一条龙 ────────</span>
+<span class="gold">  🎁 [每日完成] 每日奖励 · 已完成：</span>
+<span class="gold">    · [10:58:09.645] [INFO]: 日常奖励领取成功</span>
+<span class="gold">    · [10:58:12.917] [INFO]: 全部结束</span>
+<span class="ok">[10:58:22] ──────── 结果输出完毕 ────────</span>
+<span class="info">[10:58:22]   已关闭助手进程：OneDragon-Launcher.exe</span>
+<span class="ok">[10:58:22] [任务完成] 绝区零 · OneDragon · 一条龙 · 已完成</span>
+<span class="info"></span>
+<span class="ok">[10:58:22] ========== (2/5) 原神 · BetterGI · 一条龙 ==========</span>
+<span class="info">[10:58:22] [启动] BetterGI.exe startOneDragon</span>
+<span class="info">[10:58:22] [日志] 正在监控脚本日志：E:\Games\py\BetterGI\log\better-genshin-impact20260816.log</span>
+<span class="info">[10:58:22] [等待] 游戏启动中（最多 15 分钟）...</span>
+<span class="info">[10:58:32] [运行] 游戏已启动，等待助手完成并关闭游戏...</span>
+<span class="ok">[11:09:00] ──────── 任务结果 · 原神 · BetterGI · 一条龙 ────────</span>
+<span class="gold">  🎁 [每日完成] 每日奖励 · 已完成：</span>
+<span class="gold">    · 检查每日奖励结果："今日奖励已领取"</span>
+<span class="ok">[11:09:00] ──────── 结果输出完毕 ────────</span>
+<span class="info">[11:09:03]   已关闭助手进程：BetterGI.exe</span>
+<span class="ok">[11:09:03] [任务完成] 原神 · BetterGI · 一条龙 · 已完成</span>
+<span class="info"></span>
+<span class="ok">[11:09:03] ========== (3/5) 崩坏：星穹铁道 · March7th · 完整运行 ==========</span>
+<span class="info">[11:09:03] [启动] March7th Launcher.exe main -e</span>
+<span class="info">[11:09:03] [日志] 正在监控脚本日志：E:\Games\py\March7thAssistant_full\logs\2026-08-16.log</span>
+<span class="info">[11:09:03] [等待] 游戏启动中（最多 15 分钟）...</span>
+<span class="info">[11:09:24] [运行] 游戏已启动，等待助手完成并关闭游戏...</span>
+<span class="ok">[11:15:59] ──────── 任务结果 · 崩坏：星穹铁道 · March7th · 完整运行 ────────</span>
+<span class="err">  ❌ [每日未完成] 每日奖励 · 未完成/未领取：</span>
+<span class="err">    · 2026-08-16 11:15:25,956 | INFO | 未检测到每日实训奖励</span>
+<span class="blue">  ⚡ [体力] 剩余体力/理智：</span>
+<span class="blue">    · 2026-08-16 11:15:45,159 | INFO | 开拓力剩余3/300</span>
+<span class="ok">[11:15:59] ──────── 结果输出完毕 ────────</span>
+<span class="info">[11:16:00]   已关闭助手进程：March7th Launcher.exe</span>
+<span class="info">[11:16:02]   已关闭助手进程：March7th Assistant.exe</span>
+<span class="err">[11:16:02] [任务未完成] 崩坏：星穹铁道 · March7th · 完整运行 · 未完成</span>
+<span class="info"></span>
+<span class="ok">[11:16:02] ========== (4/5) 明日方舟 · MAA · 一键长草（MuMu/ADB） ==========</span>
+<span class="info">[11:16:02] [启动] MAA.exe</span>
+<span class="info">[11:16:02] [日志] 正在监控脚本日志：D:\新建文件夹\Google\MAA-v5.16.8-win-x64\debug\asst.log</span>
+<span class="info">[11:16:02] [等待] 等待助手运行完成并自动退出...</span>
+<span class="ok">[11:30:26] ──────── 任务结果 · 明日方舟 · MAA · 一键长草（MuMu/ADB） ────────</span>
+<span class="gold">  🎁 [每日完成] 每日奖励 · 已完成：</span>
+<span class="gold">    · [2026-08-16 11:30:19.344][INF] TaskChainCompleted {"taskchain":"Award"}</span>
+<span class="blue">  ⚡ [体力] 剩余体力/理智：</span>
+<span class="blue">    · [2026-08-16 11:28:12.403][INF] Current Sanity: 33 , Max Sanity: 205</span>
+<span class="ok">[11:30:26] ──────── 结果输出完毕 ────────</span>
+<span class="ok">[11:30:26] [任务完成] 明日方舟 · MAA · 一键长草（MuMu/ADB） · 已完成</span>
+<span class="info"></span>
+<span class="ok">[11:30:26] ========== (5/5) 明日方舟：终末地 · MaaEnd · 一键长草（PC 端） ==========</span>
+<span class="info">[11:30:29] [前置] 已通过 explorer 代理启动（普通权限，同手动双击）：Endfield.exe</span>
+<span class="info">[11:30:29] [前置] 等待 30 秒让游戏就绪，再启动脚本...</span>
+<span class="info">[11:30:59] [启动] MaaEnd.exe</span>
+<span class="info">[11:30:59] [日志] 正在监控脚本日志：E:\Games\py\MaaEnd\debug\2026-08-16-1.log</span>
+<span class="info">[11:30:59] [等待] 等待助手运行完成并自动退出...</span>
+<span class="ok">[11:49:41] ──────── 任务结果 · 明日方舟：终末地 · MaaEnd · 一键长草（PC 端） ────────</span>
+<span class="err">  ❌ [每日未完成] 每日奖励 · 未完成/未领取：</span>
+<span class="err">    · 2026-08-16 11:49:10 INFO  [Task] 任务启动异常</span>
+<span class="ok">[11:49:41] ──────── 结果输出完毕 ────────</span>
+<span class="err">[11:49:44] [任务未完成] 明日方舟：终末地 · MaaEnd · 一键长草（PC 端） · 未完成</span>
+<span class="info"></span>
+<span class="blue">★━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span>
+<span class="blue">  每日奖励完成情况汇总</span>
+<span class="blue">★━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span>
+<span class="ok">  ✅ 已完成 · 绝区零 · OneDragon · 一条龙</span>
+<span class="ok">  ✅ 已完成 · 原神 · BetterGI · 一条龙</span>
+<span class="err">  ❌ 未完成 · 崩坏：星穹铁道 · March7th · 完整运行</span>
+<span class="ok">  ✅ 已完成 · 明日方舟 · MAA · 一键长草（MuMu/ADB）</span>
+<span class="err">  ❌ 未完成 · 明日方舟：终末地 · MaaEnd · 一键长草（PC 端）</span>
+<span class="blue">  ──────────────────────────────────</span>
+<span class="warn">  结论：完成 3 个，未完成 2 个</span>
+<span class="blue">★━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span>
+<span class="info"></span>
+<span class="warn">[11:49:44] 串行队列执行完毕：有 2 个游戏任务未完成。</span>
+</pre>
+</body>
+</html>

@@ -5,6 +5,56 @@
 
 ---
 
+## 2026-08-13 · 任务完成状态明确化（已完成 / 未完成）
+
+背景：串行运行每个游戏时，旧逻辑只逐条打印「每日完成 / 每日未完成 / 体力」的匹配行；没匹配到就打印「未捕捉到相关记录」。这会导致脚本明明已完成，仍同时出现红色未完成噪音，用户无法一眼判断这个游戏到底跑完没有。
+
+备份：改动前原始文件已复制到 `backup\backup-2026-08-13-before-task-status\`。
+
+### 1. log_watcher.py —— 输出明确任务结论
+
+- 新增常量 `TASK_COMPLETED / TASK_INCOMPLETE / TASK_UNKNOWN`
+- 新增纯函数 `resolve_task_status(done_lines, pending_lines, done_configured, pending_configured)`：
+  - 完成关键词命中 → **已完成**（即使同时命中失败关键词；崩铁完成后会补打「未检测到奖励」，属正常）
+  - 配了完成关键词但没命中 → **未完成**
+  - 只配了失败关键词（MaaEnd / OneDragon）且命中失败行 → **未完成**；没有失败行 → **已完成**
+  - 两类关键词都没配 → unknown
+- `finish()` 返回新增 `task_status` 字段
+
+### 2. runner_core.py —— 每局结束输出一句明确结论
+
+- `_report_task_result` 重写：
+  - 只输出**实际匹配到**的证据行，不再给未命中分类打印「未捕捉到相关记录」
+  - 返回任务状态；未配置完成/失败关键词时返回 unknown
+- 新增 `_log_task_final`，每个游戏跑完后输出：
+  - `[任务完成] 游戏名 · 已完成`（绿色）
+  - `[任务未完成] 游戏名 · 未完成`（红色）
+  - 无法判断时输出黄色提示，绝不假装完成
+- `game` 模式下若超时未检测到游戏进程，且日志也无法给出结论，直接记**未完成**
+  - 队列跑完后，如果有任务未完成，总结行会显示「串行队列执行完毕：有 N 个游戏任务未完成」
+  - 修复打包问题：`_report_task_result_legacy` 尾部缩进错误会让 PyInstaller 把 `runner_core` 标记为 invalid module，导致 exe 运行时 `ModuleNotFoundError: runner_core`；已恢复为原始缩进
+  - `build_exe.bat` 增加打包前 `py_compile` 语法检查，避免以后再出现「PyInstaller 静默跳过坏模块、exe 启动才报 ModuleNotFoundError」
+  - 修复 `_log_task_final` 输出 `%s` 未格式化的 bug（运行日志里出现字面量 `%s`）
+  - `plugins/1_绝区零.json`：OneDragon 实际日志为 `.log\log.txt`（旧配置 `*.log` 永远匹配不到），已修正并新增完成关键词「日常奖励领取成功 / 全部结束」
+  - `plugins/5_明日方舟终末地.json`：新增完成关键词「收尾任务已提交」，编码改为 auto；任务正常收尾时能显示证据而不再空结果
+  - 崩铁「完成后复查出未检测到奖励」不再用红色 `❌ [每日未完成]` 显示，改为黄色 `ℹ️ [复查记录]`，避免出现“既完成又未完成”的视觉矛盾
+  - 队列结束前新增蓝色星形分割线「每日奖励完成情况汇总」：每行显示 ✅ 已完成 / ❌ 未完成 / ⚠ 未能确认，并统计「完成 N 个，未完成 N 个」
+    - 修正 `task_finished` 事件中的 `task_status`：跳过/失败等没有 `_last_task_status` 的情况也正确上报 `incomplete`
+    - 重新打包 `dist\一键长草助手.exe` 并覆盖根目录 `一键长草助手.exe`，确保这些修复在实际双击运行时生效
+
+
+
+
+
+
+  - 旧的 `_report_task_result_legacy` 保留在文件中仅供对照，不再被运行路径调用
+
+### 3. 测试
+
+- `tests/test_log_watcher.py` 新增 6 个 `resolve_task_status` 用例，并断言崩铁「同时命中金+红」判已完成
+- `tests/test_runner_skip.py` 新增任务状态返回、空分类噪音移除、最终结论日志 3 个用例
+
+
 ## 2026-08-13 · 日志自动保存（md）+ 导入查看
 
 背景：用户希望运行日志自动保存为 markdown，可设置保留时长（一周/一个月/不清理），并能在软件里导入查看。四个设计点均按用户确认的推荐项实施。
