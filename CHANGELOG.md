@@ -5,6 +5,79 @@
 
 ---
 
+## 2026-09-12 · 新功能：部署向导 2.0 + 助手配置一键写入（面向零基础分发）
+
+背景：exe 虽已可直接双击，但用户拿到的 90% 门槛在「安装并配置 4-5 个第三方助手」——March7th 要改 config.yaml、MAA 要勾三个开关、MaaEnd 要在任务队列末尾加收尾任务、BetterGI 要设一条龙结束操作。小白无法独立完成。目标：exe 发给零基础用户后，不碰任何配置文件、不敲任何命令即可用起来。用户决策：只发 exe+说明（不做整合包）；允许自动写入第三方配置（备份可还原）；先支持当前 5 款。
+
+### 1. 新模块 assistant_setup.py
+
+- 每个 preset_id 一个 handler（`HANDLERS`），统一接口 `handler(plugin, dry_run)`：
+  - `m7a_main`：行级替换 `config.yaml` 顶层键 `after_finish: Exit`、`pause_after_success: false`（`_patch_flat_yaml` 保留行内注释、缺键追加、UTF-8/GBK 自适应、保留换行符风格）
+  - `bettergi_onedragon`：`User\OneDragon\*.json`（取 mtime 最新）写 `CompletionAction="关闭游戏和软件"`
+  - `maa_gui`：`config\gui.json` 在 `Configurations.<Current>` 下写 `Start.RunDirectly="True"`、`Start.OpenEmulatorAfterLaunch="True"`、`MainFunction.PostActions="12"`（键名经本机 `gui.json.old` 全量历史键验证；发现本机 gui.json 曾被重置丢失三键，本次已实际写回并留有备份）
+  - `maaend_gui`：`config\mxu-MaaEnd.json` 选取 `savedDevice.connectedProgramPath` 含 Endfield.exe 的实例，任务队列末尾缺则补两个 `__MXU_KILLPROC__`（杀 Endfield.exe；SELF=true 退出 MaaEnd，保持收尾在最后）
+  - `onedragon`：`config\one_dragon.yml` 顶层键 `after_done: 关闭游戏`
+- 通用机制：写入前备份到 `<数据目录>\backup\config\<preset_id>\<时间戳>\`（manifest.json 记录原路径，`restore_backup` 整体还原）；文件缺失/解析失败**绝不盲写**，返回 `_manual_result`（ok=False + 人工指引）
+- 对外入口仅 `apply_for_plugin`（写盘）/ `verify_for_plugin`（恒 dry-run，并把「无法自动配置」转成未完成检查项）/ `list_backups` / `restore_backup` / `SUPPORTED_PRESET_IDS`；未知预设回退用插件 `setup_checklist` 渲染
+- 检查项语义：dry-run 只报「本来就是对的」；apply 写入成功后可写项恒 ✓（写失败已提前中止）
+
+### 2. 游戏助手.pyw —— 部署向导 2.0
+
+- `build_first_run` 整体重做：就绪进度总览（已导入 n 款中 ✓m 款就绪）→「助手安装根目录」可选设置 → **每款 catalog 游戏一张卡片**（状态徽标 ✓就绪/待配置/待设置路径/未导入；检查项逐条绿勾黄标；动作按钮：导入此游戏并检测路径 / 一键配置 / 重新检测 / 浏览 / 编辑 / 还原备份 / 官方下载）；一键配置结果就地回显（已自动写入 / 还需人工 / 错误）
+- 侧栏新增「★ 部署向导」常驻导航项（老用户随时可进，不再只限首次启动）
+- 新增 `_wizard_*` 方法族：卡片渲染、`_wizard_import_game`（单游戏导入+探测失败转手动浏览）、`_wizard_apply_setup`、`_wizard_rescan`（后台线程走 `ui_queue` 新事件 `wizard_scan` → `_wizard_apply_scan`）、`_wizard_browse`、`_wizard_restore`、根目录选择（向导版跳 first_run、设置页版 `_settings_pick_root` 留在设置页）
+- 设置页新增「助手安装根目录」区块（只读展示 + 修改/清除）
+- `_first_run_render_check` / `_first_run_step_box` 删除（被向导 2.0 取代）；`_first_run_import`（一键导入常用四套）保留在向导底栏
+
+### 3. preset_resolver.py —— 助手根目录 + 全固定盘符
+
+- 新增 `get_assistants_root(settings)`、`fixed_drives()`（`GetLogicalDrives + GetDriveTypeW==DRIVE_FIXED` 枚举，异常回退 C/D/E 探测）
+- `narrow_search_roots(base_dir, settings=None)` / `default_search_roots(base_dir, settings=None)`：assistants_root 排首位、base_dir 可为 None；`_max_depth_for_root` 用正则判定任意盘符根（深度 2），自定义根目录深扫（5）
+- `resolve_launcher` / `resolve_all_candidates` 的默认搜索根改为按 settings 构建（不再硬编码 `E:\ D:\`）；调用方（preset_catalog、pyw 添加页/向导）全部传入 settings
+
+### 4. 文档与打包
+
+- 使用说明.txt 零基础重写：开头「三步上手」、一键配置说明、终末地下载链接、备份还原与杀软 FAQ；同步 dist
+- `build_exe.bat`：Python 探测改为 `%USERPROFILE%\miniconda3` → `where python`（去掉用户名硬编码）；py_compile 清单补新模块
+- 新增 `tests/test_assistant_setup.py`（22 项：五款 handler 写入/幂等/dry-run 不落盘/坏 JSON 中止/备份还原/未知预设回退）；`test_preset_resolver.py` 补助手根目录 5 项；全套 **133 项通过**；GUI 冒烟（5 页面构建）通过；exe 已重新打包并同步根目录
+
+---
+
+## 2026-09-12 · 新功能：并行运行（模拟器类任务不再排队）
+
+背景：明日方舟（MAA）跑在安卓模拟器里，操作走 ADB、**不占用真实鼠标**；而原神／绝区零／崩铁等脚本会模拟真实键鼠。串行队列把 MAA 也排在队尾依次跑，浪费了"能同时跑"的机会。用户希望：勾选了「并行」的任务（如 MAA）在点开始时立即与串行任务同时跑，其余任务照旧排队。
+
+方案：插件新增 `parallel` 布尔字段（编辑页复选框「⇉ 并行运行」）；`Runner.run_all` 把队列分成并行组 + 串行组——并行组在队列开始时用独立线程同时启动（组内错峰 `PARALLEL_STAGGER_SEC=3` 秒），主线程照旧串行跑串行组，**两者全部结束后**才输出每日汇总并结束本轮。
+
+### 1. runner_core.py
+
+- 新增常量 `PARALLEL_STAGGER_SEC = 3.0` 与 `split_queue(plugins) -> (parallel_list, serial_list)`
+- `run_all` 重构：并行任务各起一个 daemon 线程跑 `_run_one(..., parallel=True)`；串行循环结束后 `join` 全部并行线程再汇总；停止时并行线程靠现有 `_stopped()` 检查自行退出并 taskkill 收尾
+- `_run_one` 拆出 `_run_one_body`；并行任务日志头为 `⇉ [并行] 名字`，该任务所有日志行带 `[名字]` 前缀（`threading.local` 存前缀，多任务日志交错可分辨），事件带 `parallel=True`（index=0，不占进度位）
+- `task_status` 改由 `_log_task_final` 写入线程本地 `final_status` 经 `out` 参数回传，不再读共享的 `_last_task_status`（并行下有竞态）；属性仍保留写入以兼容旧调用
+- `DailyDoneState` 加 `threading.Lock`（并行线程并发 mark_done 时保护 tmp+replace 写盘）
+
+### 2. 游戏助手.pyw
+
+- `load_plugins` 一次性迁移：`preset_id == "maa_gui"` 且无 `parallel` 字段的老插件自动补 `parallel: true` 写回（幂等）
+- 编辑页：显示名称下方新增复选框「⇉ 并行运行（与其它任务同时启动）」+ 灰字说明；`_save_edit` 存 `p["parallel"]`
+- 主页卡片状态行追加「· ⇉ 并行」标记
+- `_apply_run_event`：并行 task_started／task_finished 维护 `run_state["parallel_names"]`（不推进进度条），并行结果同样写入 `_run_tasks`（md 日志摘要）；`queue_finished` 时进度条走满
+- `_update_global_run_bar`：运行中 detail 追加「· ⇉ 并行：任务名」；文案「串行任务未运行」等微调为「任务未运行」
+
+### 3. preset_catalog.py / presets/catalog.json / preflight.py
+
+- `build_plugin` 新增 `"parallel": bool(script.get("parallel_default", False))`；catalog 中仅 `maa_gui` 加 `"parallel_default": true`
+- `check_plugins`：勾了并行的任务 ≥2 个时输出一条 warn（确认互不抢鼠标、不共用同一个模拟器）；仅 1 个时不提醒
+
+### 4. 测试与文档
+
+- 新增 `tests/test_runner_parallel.py`（13 项）：分区顺序、并行+串行都执行且汇总含两者、并行日志带名字前缀、坏路径跳过、预先停止不启动任何进程、纯并行队列、全串行回归、DailyDoneState 8 线程并发写盘
+- `test_preset_catalog.py` 补 parallel 字段用例；`test_preflight.py` 补并行提醒用例；全套 111 项通过
+- AI_HANDOFF.md、使用说明.txt 补「并行运行」说明
+
+---
+
 ## 2026-09-12 · 同服务器日重复运行不再误报「每日未完成」
 
 背景：所有适配游戏的每日奖励都在**凌晨 4 点**重置。同一天里白天跑成功一次、晚上再跑第二次时，脚本检测不到可领取内容会输出「未领取/未检测到」，助手按关键词判定把第二次运行判成 **❌ 未完成** 并红色报警——实际每日早已完成，属于系统性误报（日志分析中 09-05 凌晨连续 3 次重跑失败同属 4 点重置前运行导致）。

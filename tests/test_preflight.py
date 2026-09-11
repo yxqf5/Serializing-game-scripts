@@ -49,6 +49,25 @@ class TestPreflight(unittest.TestCase):
         ])
         self.assertTrue(any("已在运行" in i["message"] for i in issues))
 
+    def test_single_parallel_plugin_no_warning(self):
+        issues = preflight.check_plugins([
+            {"enabled": True, "name": "明日方舟", "launcher": __file__,
+             "game_processes": [], "helper_processes": [], "parallel": True},
+        ])
+        self.assertFalse(any("并行" in i["message"] for i in issues))
+
+    def test_multiple_parallel_plugins_warn(self):
+        issues = preflight.check_plugins([
+            {"enabled": True, "name": "游戏A", "launcher": __file__,
+             "game_processes": [], "helper_processes": [], "parallel": True},
+            {"enabled": True, "name": "游戏B", "launcher": __file__,
+             "game_processes": [], "helper_processes": [], "parallel": True},
+        ])
+        warns = [i for i in issues if i["level"] == "warn" and "并行" in i["message"]]
+        self.assertEqual(len(warns), 1)
+        self.assertIn("游戏A", warns[0]["message"])
+        self.assertIn("游戏B", warns[0]["message"])
+
 
 if __name__ == "__main__":
     unittest.main()

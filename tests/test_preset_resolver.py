@@ -80,5 +80,49 @@ class TestPresetResolver(unittest.TestCase):
         self.assertEqual(src, "timeout")
 
 
+class TestAssistantsRoot(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def test_get_assistants_root(self):
+        self.assertEqual(pr.get_assistants_root(None), "")
+        self.assertEqual(pr.get_assistants_root({}), "")
+        raw = os.path.join(self.tmp, "asroot")
+        self.assertEqual(pr.get_assistants_root({"assistants_root": raw}),
+                         os.path.normpath(raw))
+
+    def test_narrow_roots_put_assistants_root_first(self):
+        sub = os.path.join(self.tmp, "asroot")
+        os.makedirs(sub)
+        roots = pr.narrow_search_roots(self.tmp, {"assistants_root": sub})
+        self.assertEqual(roots[0], os.path.normpath(sub))
+
+    def test_default_roots_contain_fixed_drives(self):
+        roots = pr.default_search_roots(self.tmp, {})
+        drives = pr.fixed_drives()
+        self.assertTrue(drives)
+        for drv in drives:
+            self.assertIn(os.path.normpath(drv), roots)
+
+    def test_assistants_root_scanned_deep(self):
+        # 助手根目录下的深层结构也能扫到（盘符根只浅扫，根目录深扫）
+        root = os.path.join(self.tmp, "asroot")
+        exe = os.path.join(root, "a", "b", "c", "MaaEnd.exe")
+        os.makedirs(os.path.dirname(exe))
+        with open(exe, "wb") as f:
+            f.write(b"")
+        script = {"id": "maaend_gui", "launcher_hints": [],
+                  "launcher_globs": ["**/MaaEnd.exe"]}
+        path, src = pr.resolve_launcher(script, {"assistants_root": root},
+                                        use_cache=False)
+        self.assertEqual(src, "glob")
+        self.assertTrue(path.endswith("MaaEnd.exe"))
+
+    def test_max_depth_for_drive_root(self):
+        self.assertEqual(pr._max_depth_for_root("E:\\"), 2)
+        self.assertEqual(pr._max_depth_for_root("Q:\\"), 2)
+        self.assertEqual(pr._max_depth_for_root(os.path.join(self.tmp, "x")), 5)
+
+
 if __name__ == "__main__":
     unittest.main()

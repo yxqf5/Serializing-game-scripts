@@ -9,7 +9,7 @@
 
 ## 1. 项目一句话
 
-一个 tkinter 桌面 GUI(单窗口,自绘部分标题栏),把多个游戏的**第三方自动化脚本**排队串行运行:一次只跑一个,跑完关闭后自动启动下一个。**本工具只是调度器,不含脚本本体**——用户要自己去官方页下载脚本。
+一个 tkinter 桌面 GUI(单窗口,自绘部分标题栏),把多个游戏的**第三方自动化脚本**排队运行:默认一次只跑一个,跑完关闭后自动启动下一个;勾选了「⇉ 并行运行」的任务(如 MAA,游戏在模拟器里、不占真实鼠标)会在队列开始时与串行任务**同时启动**。**本工具只是调度器,不含脚本本体**——用户要自己去官方页下载脚本。
 
 已适配:BetterGI(原神)、March7th(崩铁)、OneDragon(绝区零)、MAA(明日方舟)、MaaEnd(终末地)、ok-ww(鸣潮)、M9A(重返未来 1999)。
 
@@ -21,7 +21,8 @@
 游戏助手.pyw          单窗口 GUI 主程序(tkinter) —— 唯一入口
 runner_core.py        串行执行引擎(subprocess + tasklist 轮询) —— 与 UI 解耦
 preset_catalog.py     预设 catalog 加载 / plugin 构造 / 一键导入
-preset_resolver.py    启动器路径探测:hints → glob → 缓存
+preset_resolver.py    启动器路径探测:缓存 → 助手根目录 → hints → 全固定盘符 glob
+assistant_setup.py    第三方助手推荐配置一键写入 / 备份还原 / 自检(部署向导用)
 preflight.py          运行前自检:路径 / 管理员 / 进程占用
 quick_fill.py         "粘贴 键:值" 快速填充解析
 app_paths.py          资源路径 & 数据目录(EXE 打包时区分)
@@ -114,27 +115,62 @@ AI_HANDOFF.md         本文件
 
 `build_plugin` 会把 `preset_id`、`preset_game_id`、`setup_checklist`、`doc_url` 都一并写进 plugin,便于卡片和编辑页展示。
 
-### 3.5 路径探测三层策略(preset_resolver.py)
+### 3.5 并行运行(parallel 字段)
+
+每个插件可勾选 `parallel: true`(编辑页「⇉ 并行运行」复选框),语义:
+
+- **启动**:点「开始运行」后,全部并行任务立即用独立线程同时启动(组内按卡片顺序、间隔 `PARALLEL_STAGGER_SEC=3` 秒错峰);串行任务照旧依次跑,两组互不等待。
+- **结束**:串行队列跑完后 `join` 等全部并行任务收尾,才输出每日汇总;中途点「停止」则两组一起中止。
+- **适用判断**:操作走 ADB/模拟器(不占真实鼠标)→ 可勾;模拟真实键鼠的脚本(原神 BetterGI、绝区零 OneDragon、崩铁 March7th 等)→ 不可勾,否则互相抢鼠标。catalog 预设可用 `parallel_default: true` 提供默认值(目前只有 MAA);老插件由 `load_plugins` 对 `maa_gui` 一次性自动补勾。
+- **日志**:并行任务每行日志带 `[任务名]` 前缀,日志头是 `⇉ [并行] 名字`(前缀存 `threading.local`,多任务日志交错可分辨)。
+- **执行事件**:并行任务的 run 事件带 `parallel=True` 且 `index=0`,GUI 不让它占进度条,运行栏 detail 显示「⇉ 并行:任务名」;≥2 个并行任务时 preflight 会有黄色提醒。
+
+### 3.6 路径探测四层策略(preset_resolver.py)
 
 ```
-1. cache      settings.json["path_cache"][script_id]
-2. hint       catalog 的 launcher_hints 列表(逐个 os.path.isfile)
-3. glob       在 default_search_roots(E:\、D:\、BASE_DIR、E:\Games、D:\Games)
-              做有限深度 fnmatch(盘符根深度 2,子目录深度 5,10 秒超时)
+1. cache          settings.json["path_cache"][script_id]
+2. assistants_root settings.json["assistants_root"](用户在向导/设置页指定的
+                  「助手安装根目录」,深扫,命中率高;为空则跳过)
+3. hint           catalog 的 launcher_hints 列表(逐个 os.path.isfile)
+4. glob           在 default_search_roots(全部固定盘符 + BASE_DIR、
+                  E:\Games、D:\Games、assistants_root)做有限深度 fnmatch
+                  (盘符根深度 2,其余深度 5,10 秒超时)
 ```
 
-UI 层新版(2026-07):**添加页深度探测调用 `resolve_all_candidates`**,最多返回 8 个候选,≥2 个时在路径输入框下方显示可点击列表。
+盘符不再硬编码 E:/D:`fixed_drives()` 用 `GetLogicalDrives + GetDriveTypeW` 枚举固定磁盘(非 Windows 回退 C/D/E 探测)。
+
+UI 层新版(2026-07):**添加页深度探测调用 `resolve_all_candidates`**,最多返回 8 个候选,≥2 个时在路径输入框下方显示可点击列表。部署向导(2026-09)每张卡片也有独立的「重新检测」(走 `wizard_scan` UI 事件)。
+
+### 3.7 一键配置(assistant_setup.py)
+
+把「串行化必需」的助手设置自动写进各助手自己的配置文件,`HANDLERS` 按 `preset_id` 分发:
+
+| preset_id | 目标文件 | 写入内容 |
+|---|---|---|
+| `m7a_main` | `<助手目录>\config.yaml` | `after_finish: Exit`、`pause_after_success: false`(顶层键行级替换,保留行内注释,UTF-8/GBK 自适应) |
+| `bettergi_onedragon` | `User\OneDragon\*.json`(取最新) | `CompletionAction = "关闭游戏和软件"` |
+| `maa_gui` | `config\gui.json` | `Configurations.Default` 下 `Start.RunDirectly="True"`、`Start.OpenEmulatorAfterLaunch="True"`、`MainFunction.PostActions="12"`(退出模拟器+退出MAA;键名来自本机 gui.json.old 全量历史验证) |
+| `maaend_gui` | `config\mxu-MaaEnd.json` | 任务队列末尾补两个 `__MXU_KILLPROC__` 任务(杀 Endfield.exe + SELF 退出自身);实例按 `savedDevice.connectedProgramPath` 含 Endfield.exe 选取 |
+| `onedragon` | `config\one_dragon.yml` | 顶层键 `after_done: 关闭游戏` |
+
+关键约束:
+- **写入前必备份**到 `<数据目录>\backup\config\<preset_id>\<时间戳>\`(含 manifest.json),`restore_backup` 可整体还原
+- **绝不盲写**:文件缺失 / 解析失败立即返回 `_manual_result`(ok=False,manual 放人工指引),UI 回退为指引文案
+- `apply_for_plugin(plugin)` 会写盘;`verify_for_plugin(plugin)` 恒为 dry-run 只检查不写,并能把「无法自动配置」转成未完成检查项供向导渲染
+- 未知 preset(鸣潮/1999/custom)不走写入,回退用插件自带 `setup_checklist` 渲染
+- 检查项语义:dry-run 时「本来就是对的」才 ✓;apply 写入成功后可写项恒 ✓(写失败已提前返回 manual)
 
 ---
 
 ## 4. 主要模块速览
 
 ### runner_core.py
-串行执行引擎。`Runner(log_callback, stop_event).run_all(plugins)`。
+执行引擎。`Runner(log_callback, stop_event).run_all(plugins)`。
 - 用 `subprocess.Popen([launcher] + args)` 启动脚本
 - 用 `tasklist /FI "IMAGENAME eq X.exe"` 轮询进程状态(`CREATE_NO_WINDOW`,不弹黑窗)
 - 支持 `pre_launcher`(前置程序,如 MaaEnd 需要先启动 Endfield.exe)
 - 支持 `stop_event` 中止
+- **并行**:先按 `split_queue` 分成并行组(`parallel: true`,独立线程同时启动、错峰 3 秒)与串行组,两组都结束后才汇总;并行任务日志带 `[任务名]` 前缀
 
 ### preflight.py
 `check_plugins(plugins)` 返回 issue 列表(level: error|warn|info)。
@@ -150,10 +186,13 @@ UI 层新版(2026-07):**添加页深度探测调用 `resolve_all_candidates`**,�
 - `_refresh_home_status`  **主页顶部状态条**(新增,汇总🟢就绪 🟡待办 🔴无效)
 - `_add_rescan` / `_add_apply_scan_result` / `_add_pick_candidate`  **路径多候选**(新增)
 - `_add_apply_custom_mode` / `_build_add_custom_frame` / `_add_custom_use_reference` / `_add_custom_use_blank`  **自定义分支两选项**(新增)
-- `_first_run_render_check` / `_first_run_import`  **首次向导第 3 步的路径检测清单**(新增)
+- `build_first_run`(2026-09 重做为**部署向导 2.0**):就绪进度条 + 助手安装根目录 + 每款游戏一张卡片(下载/导入/一键配置/还原备份/重新检测),相关方法 `_wizard_*`(卡片渲染、单游戏导入、apply、rescan、browse、restore);侧栏新增「★ 部署向导」常驻入口
 - `_open_url`  用 `webbrowser.open` 打开链接
 - `start_run` / `_finish_preflight` / `stop_run`  运行控制
-- `_drain_log`  100ms 轮询 log_queue 和 ui_queue
+- `_drain_log`  100ms 轮询 log_queue 和 ui_queue(含 `wizard_scan` 事件 → `_wizard_apply_scan`)
+
+### assistant_setup.py
+见 3.7。对外只有 `apply_for_plugin` / `verify_for_plugin` / `list_backups` / `restore_backup` / `SUPPORTED_PRESET_IDS` 五个入口,UI 不要绕过它们直接改第三方配置。
 
 **导航:** `self.go(name)` 切换页面,name ∈ {home, edit, add, first_run, settings, help}。
 
@@ -176,6 +215,16 @@ UI 层新版(2026-07):**添加页深度探测调用 `resolve_all_candidates`**,�
 4. **主页顶部常驻状态条** —— 🟢N 就绪 / 🟡N 待办 / 🔴N 路径无效 + 非管理员警告
 
 catalog.json 中每个 game 加了 `download_url` 字段(优先于 `doc_url` 作为下载入口)。
+
+## 5.1 易用性改造二期(2026-09)——面向零基础分发
+
+目标:exe 发给电脑小白后,不碰任何配置文件/命令行即可用起来。
+
+1. **部署向导 2.0**(`build_first_run` 重做):就绪进度总览 + 「助手安装根目录」可选设置 + 每款游戏一张卡片(状态徽标 ✓就绪/待配置/未导入,检查项绿勾黄标,动作按钮 导入/一键配置/重新检测/浏览/还原备份);侧栏加「★ 部署向导」常驻入口
+2. **一键配置助手**(新模块 `assistant_setup.py`,见 3.7):五款助手的「跑完自动关游戏/自动退出」设置一键写入 + 备份还原
+3. **路径探测增强**:`settings.assistants_root` 用户自定根目录优先深扫;盘符改 `GetLogicalDrives` 枚举全固定盘,不再硬编码 E:/D:
+4. **使用说明.txt 零基础重写**:开头即「三步上手」,补终末地下载链接、一键配置说明、备份还原 FAQ
+5. 测试从 111 → 133 项(新增 `tests/test_assistant_setup.py` 22 项 + resolver 助手根目录 5 项)
 
 ---
 

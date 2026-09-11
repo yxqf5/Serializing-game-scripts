@@ -49,6 +49,19 @@ class TestPresetCatalog(unittest.TestCase):
         self.assertEqual(p["preset_id"], "onedragon")
         self.assertIn("-o", p["args"])
         self.assertEqual(p["wait_mode"], "game")
+        self.assertFalse(p.get("parallel", True))
+
+    def test_build_plugin_parallel_default(self):
+        """MAA 预设默认并行；其他预设默认串行。"""
+        cat = pc.load_catalog()
+        g = pc.get_game(cat, "arknights")
+        s = pc.get_script(g, "maa_gui")
+        p = pc.build_plugin(g, s, r"E:\test\MAA.exe", order=98)
+        self.assertTrue(p["parallel"])
+        g2 = pc.get_game(cat, "reverse1999")
+        s2 = pc.get_script(g2, "m9a_cli")
+        p2 = pc.build_plugin(g2, s2, r"E:\test\MaaPiCli.exe", order=97)
+        self.assertFalse(p2["parallel"])
 
     def test_pending_checklist_count(self):
         p = {"setup_checklist": ["a", "b"], "checklist_done": ["a"]}

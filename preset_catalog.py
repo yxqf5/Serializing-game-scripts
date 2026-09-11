@@ -92,6 +92,7 @@ def build_plugin(game, script, launcher_path, order=None, checklist_done=None):
         "game_processes": list(game_procs),
         "helper_processes": list(script.get("helper_processes", [])),
         "start_timeout_min": int(script.get("start_timeout_min", 15)),
+        "parallel": bool(script.get("parallel_default", False)),
         "enabled": True,
         "order": order,
         "notes": script.get("notes", ""),
@@ -134,7 +135,7 @@ def resolve_and_build(game_id, script_id, settings, launcher_override=None):
     if launcher_override:
         path = os.path.normpath(launcher_override)
     else:
-        roots = default_search_roots(BASE_DIR)
+        roots = default_search_roots(BASE_DIR, settings)
         path, _ = resolve_launcher(script, settings, roots)
 
     return build_plugin(game, script, path)
@@ -157,7 +158,7 @@ def import_default_plugins(settings, overwrite=False):
                 pass
 
     catalog = load_catalog()
-    roots = default_search_roots(BASE_DIR)
+    roots = default_search_roots(BASE_DIR, settings)
     created = 0
     order = 1
     for game_id, script_id in DEFAULT_PRESET_IDS:

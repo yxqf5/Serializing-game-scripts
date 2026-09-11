@@ -1,41 +1,76 @@
 # -*- coding: utf-8 -*-
-"""启动器路径探测：hints 优先，有限深度 glob，结果可缓存。"""
+"""启动器路径探测：缓存 → 助手根目录 → hints → 有限深度 glob，结果可缓存。"""
 
 import os
 import fnmatch
+import re
 import time
 
 SCAN_TIMEOUT_SEC = 10
 
 
-def narrow_search_roots(base_dir):
-    """快速探测：仅助手目录及相邻路径，避免 UI 卡顿。"""
+def get_assistants_root(settings):
+    """用户在向导/设置里指定的「助手安装根目录」（可为空）。"""
+    root = ""
+    try:
+        root = (settings or {}).get("assistants_root", "") or ""
+    except Exception:
+        root = ""
+    return os.path.normpath(root) if root else ""
+
+
+def fixed_drives():
+    """枚举所有固定磁盘盘符（跳过光驱 / U 盘 / 网络盘）。"""
+    drives = []
+    if os.name == "nt":
+        try:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            bitmask = k32.GetLogicalDrives()
+            for i in range(26):
+                if (bitmask >> i) & 1:
+                    letter = "%s:\\" % chr(ord("A") + i)
+                    if k32.GetDriveTypeW(letter) == 3:  # DRIVE_FIXED
+                        drives.append(letter)
+        except Exception:
+            drives = []
+    if not drives:  # 非 Windows 或枚举失败：退回常见盘符
+        drives = [p for p in ("C:\\", "D:\\", "E:\\") if os.path.isdir(p)]
+    return drives
+
+
+def _add_root(roots, p):
+    p = os.path.normpath(p)
+    if os.path.isdir(p) and p not in roots:
+        roots.append(p)
+
+
+def narrow_search_roots(base_dir, settings=None):
+    """快速探测：助手根目录 → 助手目录及相邻路径，避免 UI 卡顿。"""
     roots = []
-    for p in [base_dir, os.path.dirname(base_dir)]:
-        p = os.path.normpath(p)
-        if os.path.isdir(p) and p not in roots:
-            roots.append(p)
+    ar = get_assistants_root(settings)
+    if ar:
+        _add_root(roots, ar)
+    if base_dir:
+        for p in [base_dir, os.path.dirname(base_dir)]:
+            _add_root(roots, p)
     for p in ["E:\\Games", "D:\\Games"]:
-        p = os.path.normpath(p)
-        if os.path.isdir(p) and p not in roots:
-            roots.append(p)
+        _add_root(roots, p)
     return roots
 
 
-def default_search_roots(base_dir):
-    """完整探测：常见游戏目录 + 盘符根（盘符仅浅层扫描）。"""
-    roots = list(narrow_search_roots(base_dir))
-    for p in ["E:\\", "D:\\"]:
-        p = os.path.normpath(p)
-        if os.path.isdir(p) and p not in roots:
-            roots.append(p)
+def default_search_roots(base_dir, settings=None):
+    """完整探测：助手根目录 → 常见游戏目录 → 全部固定盘符（盘符仅浅层扫描）。"""
+    roots = list(narrow_search_roots(base_dir, settings))
+    for drv in fixed_drives():
+        _add_root(roots, drv)
     return roots
 
 
 def _max_depth_for_root(root, default_depth=5):
-    """盘符根目录浅扫，子目录深扫。"""
+    """盘符根目录浅扫，其余（含助手根目录）深扫。"""
     root = os.path.normpath(root)
-    if root.rstrip("\\").upper() in ("E:", "D:", "C:"):
+    if re.match(r"^[A-Za-z]:$", root.rstrip("\\").upper()):
         return 2
     return default_depth
 
@@ -103,7 +138,7 @@ def resolve_launcher(script, settings=None, search_roots=None, use_cache=True, a
         return "", "none"
 
     if search_roots is None:
-        search_roots = ["E:\\", "D:\\"]
+        search_roots = default_search_roots(None, settings)
 
     deadline = _scan_deadline(timeout_sec)
     seen = set()
@@ -127,10 +162,11 @@ def resolve_launcher(script, settings=None, search_roots=None, use_cache=True, a
     return "", "none"
 
 
-def resolve_all_candidates(script, search_roots=None, max_results=10, timeout_sec=SCAN_TIMEOUT_SEC):
+def resolve_all_candidates(script, search_roots=None, max_results=10, timeout_sec=SCAN_TIMEOUT_SEC,
+                           settings=None):
     """返回所有候选路径（去重），供用户选择。"""
     if search_roots is None:
-        search_roots = ["E:\\", "D:\\"]
+        search_roots = default_search_roots(None, settings)
 
     deadline = _scan_deadline(timeout_sec)
 

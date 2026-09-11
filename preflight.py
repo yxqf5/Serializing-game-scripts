@@ -50,6 +50,16 @@ def check_plugins(plugins, running_names=None):
             "message": "当前非管理员模式，部分脚本可能无法正常启动（建议以管理员运行 exe）。",
         })
 
+    parallel_names = [p.get("name", "未命名") for p in enabled if p.get("parallel")]
+    if len(parallel_names) >= 2:
+        # 只勾 1 个并行任务时是常规用法，不提醒；≥2 个才可能出现互相抢占
+        issues.append({
+            "level": "warn",
+            "plugin_name": "",
+            "message": "%d 个任务勾选了并行，将同时启动（%s）——请确认它们互不抢占鼠标、"
+                       "也不共用同一个模拟器。" % (len(parallel_names), "、".join(parallel_names)),
+        })
+
     for p in enabled:
         name = p.get("name", "未命名")
         launcher = p.get("launcher", "")

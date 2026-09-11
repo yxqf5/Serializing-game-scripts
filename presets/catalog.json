@@ -107,6 +107,7 @@
           "args": [],
           "wait_mode": "helper",
           "helper_processes": ["MAA.exe"],
+          "parallel_default": true,
           "start_timeout_min": 15,
           "setup_checklist": [
             "MAA：启动后自动开始任务",

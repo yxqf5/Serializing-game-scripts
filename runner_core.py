@@ -13,6 +13,7 @@
 import os
 import json
 import time
+import threading
 import subprocess
 import datetime
 import inspect
@@ -52,6 +53,16 @@ TASK_UNKNOWN = "unknown"
 # 游戏服务器每日重置时刻（凌晨 4 点）：4 点前属于上一个服务器日
 DAILY_RESET_HOUR = 4
 
+# 多个并行任务之间的启动间隔（秒）：错峰拉起，避免同时开多个模拟器挤爆 CPU/磁盘
+PARALLEL_STAGGER_SEC = 3.0
+
+
+def split_queue(plugins):
+    """按 parallel 字段把已启用的插件分成（并行组，串行组），各自保持原顺序。"""
+    parallel = [p for p in plugins if p.get("parallel")]
+    serial = [p for p in plugins if not p.get("parallel")]
+    return parallel, serial
+
 
 def server_day(dt):
     """游戏服务器日：以凌晨 4 点为界，4 点前属于上一个自然日。"""
@@ -83,6 +94,7 @@ class DailyDoneState:
 
     def __init__(self, path=None):
         self.path = path
+        self._lock = threading.Lock()  # 并行任务线程会并发记录完成状态
         self._done = {}
         self._load()
 
@@ -110,9 +122,10 @@ class DailyDoneState:
             return None
 
     def mark_done(self, key, dt=None):
-        self._done[str(key)] = (dt or datetime.datetime.now()).isoformat(
-            timespec="seconds")
-        self._save()
+        with self._lock:
+            self._done[str(key)] = (dt or datetime.datetime.now()).isoformat(
+                timespec="seconds")
+            self._save()
 
     def _save(self):
         if not self.path:
@@ -272,6 +285,8 @@ class Runner:
         self.settle_sec = max(0.0, float(settle_sec))
         self._log_accepts_level = _func_accepts_kwarg(log_func, "level")
         self._last_task_status = None
+        # 并行任务线程各自的日志前缀与最终状态（线程本地，互不干扰）
+        self._tls = threading.local()
         # 同服务器日重复运行判定所需的完成记录（不传则仅内存，测试用）
         self.daily_state = DailyDoneState(daily_state_file)
 
@@ -294,7 +309,10 @@ class Runner:
         return self.stop_event is not None and self.stop_event.is_set()
 
     def _log(self, msg, level=LEVEL_INFO):
-        """输出日志；兼容只接受 msg 的旧回调。"""
+        """输出日志；兼容只接受 msg 的旧回调。并行任务线程自动带名字前缀。"""
+        prefix = getattr(self._tls, "prefix", "")
+        if prefix:
+            msg = prefix + msg
         if self._log_accepts_level:
             self.log(msg, level=level)
         else:
@@ -323,46 +341,134 @@ class Runner:
             self._tlog("[警告]   官方文档：%s" % doc, level=LEVEL_WARN)
 
     def run_all(self, plugins):
-        """plugins：已按 order 排序、且只含 enabled 的插件 dict 列表。"""
-        total = len(plugins)
-        incomplete = 0
-        summary_rows = []
-        self._emit("queue_started", total=total)
-        self._tlog("开始串行执行，共 %d 个游戏。" % total)
+        """plugins：已按 order 排序、且只含 enabled 的插件 dict 列表。
+
+        带 parallel=True 的任务（模拟器/后台类脚本，不抢鼠标）在队列开始时
+        同时启动，与串行任务并行执行；其余任务仍按顺序逐个运行。
+        串行 + 并行全部结束后才输出汇总。
+        """
+        parallel_plugins, serial_plugins = split_queue(plugins)
+        total_serial = len(serial_plugins)
+        n_parallel = len(parallel_plugins)
+        self._emit("queue_started", total=total_serial, parallel_total=n_parallel)
+        if n_parallel:
+            self._tlog("开始执行：共 %d 个游戏，其中 %d 个并行同时启动。"
+                       % (len(plugins), n_parallel))
+        else:
+            self._tlog("开始串行执行，共 %d 个游戏。" % total_serial)
         self._log("")
-        for idx, p in enumerate(plugins, 1):
+
+        summary_rows = []
+        incomplete = 0
+        results_lock = threading.Lock()
+        parallel_results = []  # [(name, result, task_status)]
+        threads = []
+        for j, p in enumerate(parallel_plugins):
+            t = threading.Thread(
+                target=self._run_parallel_plugin,
+                args=(j, p, parallel_results, results_lock,
+                      PARALLEL_STAGGER_SEC * j),
+                daemon=True)
+            threads.append(t)
+            t.start()
+
+        stopped_early = False
+        for idx, p in enumerate(serial_plugins, 1):
             if self._stopped():
                 self._tlog("已被用户中止。", level=LEVEL_WARN)
-                self._emit("queue_finished", result="stopped", total=total)
-                return
+                stopped_early = True
+                break
             name = p.get("name", p.get("id", "未知"))
-            self._emit("task_started", index=idx, total=total, name=name)
-            result = self._run_one(idx, total, p)
-            task_status = getattr(self, "_last_task_status", None) or TASK_UNKNOWN
+            self._emit("task_started", index=idx, total=total_serial, name=name)
+            out = {}
+            result = self._run_one(idx, total_serial, p, out=out)
+            task_status = out.get("task_status") or TASK_UNKNOWN
             if result in ("failed", "skipped"):
                 task_status = TASK_INCOMPLETE
             if task_status == TASK_INCOMPLETE:
                 incomplete += 1
             summary_rows.append((name, task_status))
-            self._emit("task_finished", index=idx, total=total, name=name, result=result,
+            self._emit("task_finished", index=idx, total=total_serial, name=name, result=result,
                        task_status=task_status)
             self._log("")
             if result == "stopped":
                 self._tlog("已被用户中止。", level=LEVEL_WARN)
-                self._emit("queue_finished", result="stopped", total=total)
-                return
+                stopped_early = True
+                break
+
+        # 串行队列结束（完成或被中止）后，等全部并行任务收尾
+        for t in threads:
+            t.join()
+        if not serial_plugins and self._stopped():
+            self._tlog("已被用户中止。", level=LEVEL_WARN)
+            stopped_early = True
+
+        for name, result, task_status in parallel_results:
+            if result in ("failed", "skipped"):
+                task_status = TASK_INCOMPLETE
+            if task_status == TASK_INCOMPLETE:
+                incomplete += 1
+            summary_rows.append((name, task_status))
+
+        if stopped_early:
+            self._emit("queue_finished", result="stopped", total=total_serial)
+            return
         self._log_daily_summary(summary_rows)
         if incomplete:
-            self._tlog("串行队列执行完毕：有 %d 个游戏任务未完成。" % incomplete, level=LEVEL_WARN)
+            if n_parallel:
+                self._tlog("全部队列执行完毕：有 %d 个游戏任务未完成。" % incomplete, level=LEVEL_WARN)
+            else:
+                self._tlog("串行队列执行完毕：有 %d 个游戏任务未完成。" % incomplete, level=LEVEL_WARN)
         else:
             self._tlog("全部任务执行完成。", level=LEVEL_OK)
-        self._emit("queue_finished", result="completed", total=total)
+        self._emit("queue_finished", result="completed", total=total_serial)
 
-    def _run_one(self, idx, total, p):
+    def _run_parallel_plugin(self, j, p, results, lock, delay_sec):
+        """并行任务线程体：错峰启动 → 执行 → 结果写入共享列表。"""
+        name = p.get("name", p.get("id", "未知"))
+        if self._stopped():
+            result, task_status = "stopped", TASK_UNKNOWN
+        else:
+            if delay_sec > 0:
+                self._tlog("[并行] %s 将在 %d 秒后启动..." % (name, int(delay_sec)))
+                self._sleep_interruptible(delay_sec)
+            self._emit("task_started", index=0, total=0, name=name, parallel=True)
+            out = {}
+            try:
+                result = self._run_one(j + 1, 0, p, parallel=True, out=out)
+                task_status = out.get("task_status") or TASK_UNKNOWN
+                if result in ("failed", "skipped"):
+                    task_status = TASK_INCOMPLETE
+            except Exception as e:
+                self._tlog("[失败] %s 发生错误：%s" % (name, e), level=LEVEL_ERROR)
+                result, task_status = "failed", TASK_INCOMPLETE
+            self._emit("task_finished", index=0, total=0, name=name, result=result,
+                       task_status=task_status, parallel=True)
+        with lock:
+            results.append((name, result, task_status))
+
+    def _run_one(self, idx, total, p, parallel=False, out=None):
         name = p.get("name", p.get("id", "未知"))
         self._last_task_status = None
-        self._tlog("========== (%d/%d) %s ==========" % (idx, total, name), level=LEVEL_OK)
+        self._tls.final_status = None
+        if parallel:
+            # 并行任务的所有日志行加名字前缀：多任务日志交错时仍可分辨归属
+            self._tls.prefix = "[%s] " % name
+            self._tlog("========== ⇉ [并行] %s ==========" % name, level=LEVEL_OK)
+        else:
+            self._tlog("========== (%d/%d) %s ==========" % (idx, total, name), level=LEVEL_OK)
         event_base = {"index": idx, "total": total, "name": name}
+        if parallel:
+            event_base["parallel"] = True
+        try:
+            return self._run_one_body(idx, total, p, name, event_base)
+        finally:
+            if parallel:
+                self._tls.prefix = ""
+            if out is not None:
+                out["task_status"] = getattr(self._tls, "final_status", None)
+
+    def _run_one_body(self, idx, total, p, name, event_base):
         self._stage("checking", "正在检查配置", **event_base)
 
         skip = plugin_skip_reason(p)
@@ -640,6 +746,7 @@ class Runner:
     def _log_task_final(self, name, task_status, log_configured):
         """输出每个游戏脚本的最终结论：已完成 / 未完成（或无法判断）。"""
         self._last_task_status = task_status
+        self._tls.final_status = task_status
         if task_status == TASK_COMPLETED:
             self._tlog("[任务完成] %s · 已完成" % name, level=LEVEL_OK)
         elif task_status == TASK_INCOMPLETE:

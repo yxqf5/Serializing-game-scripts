@@ -51,8 +51,10 @@ import preset_catalog as pc
 from preset_resolver import (
     resolve_launcher, resolve_all_candidates,
     default_search_roots, narrow_search_roots, update_path_cache,
+    get_assistants_root,
 )
 import preflight
+import assistant_setup
 import quick_fill as qf
 import log_saver
 from ui_helpers import LogStore, clamp_window_bounds, elide_end, elide_middle, group_tagged_lines
@@ -136,6 +138,14 @@ def load_plugins():
         except Exception as e:
             print("读取插件失败：", f, e)
     items.sort(key=lambda x: (int(x.get("order", 999)), x.get("name", "")))
+    # 一次性迁移：MAA（模拟器脚本，不抢鼠标）默认并行，老插件文件自动补勾
+    for d in items:
+        if d.get("preset_id") == "maa_gui" and "parallel" not in d:
+            d["parallel"] = True
+            try:
+                save_plugin(d)
+            except Exception:
+                pass
     return items
 
 
@@ -193,6 +203,7 @@ class App(tk.Tk):
         self.run_state = {
             "state": "idle", "index": 0, "total": 0,
             "name": "", "message": "就绪", "result": None,
+            "parallel_names": [],
         }
 
         self.current_view = None
@@ -440,6 +451,7 @@ class App(tk.Tk):
 
         self.nav_items = {}
         self._nav("home", "主页", "▶")
+        self._nav("first_run", "部署向导", "★")
 
         # 底部：设置 / 帮助 / 管理员状态
         bottom = tk.Frame(self.sidebar, bg=t["panel"])
@@ -916,6 +928,8 @@ class App(tk.Tk):
         status_text = "✓ 就绪" if ok else "✗ 路径无效"
         if pending:
             status_text += "  ·  ⚠ %d 项待办" % pending
+        if p.get("parallel"):
+            status_text += "  ·  ⇉ 并行"
         st_lbl = tk.Label(mid, text=status_text, bg=panel,
                           fg=(t["err"] if not ok else (t["warn"] if pending else t["ok"])),
                           font=F(9), anchor="w", justify="left")
@@ -1067,6 +1081,17 @@ class App(tk.Tk):
 
         label("显示名称")
         self.e_name = entry(form, p.get("name", ""))
+
+        self.parallel_var = tk.BooleanVar(value=bool(p.get("parallel", False)))
+        tk.Checkbutton(form, text="⇉ 并行运行（与其它任务同时启动）", variable=self.parallel_var,
+                       bg=t["bg"], fg=t["fg"], selectcolor=t["panel"],
+                       activebackground=t["bg"], activeforeground=t["accent"],
+                       font=F(11, True), anchor="w").pack(anchor="w", pady=(10, 0))
+        tk.Label(form, text="适合模拟器／后台类脚本（如 MAA）：点「开始运行」时立即与其它任务同时跑，不用排队等。"
+                            "会抢占真实鼠标的脚本（原神、绝区零、崩铁等）不要勾，否则会互相抢鼠标；"
+                            "多个勾了并行的任务也会同时启动。",
+                 bg=t["bg"], fg=t["sub"], font=F(9), anchor="w", justify="left",
+                 wraplength=760).pack(anchor="w")
 
         label("脚本 / 启动器程序（.exe）", "就是平时你双击打开的那个脚本程序。")
         pf = tk.Frame(form, bg=t["bg"]); pf.pack(fill="x")
@@ -1263,6 +1288,7 @@ class App(tk.Tk):
         p.pop("fail_patterns", None)
         p.pop("tail_lines", None)
         p["wait_mode"] = self.wait_var.get()
+        p["parallel"] = bool(self.parallel_var.get())
         p["game_processes"] = self._split(self.e_game.get())
         p["helper_processes"] = self._split(self.e_helper.get())
         try:
@@ -1544,6 +1570,22 @@ class App(tk.Tk):
 
         tk.Label(wrap, text="提示：若觉得字体偏小或偏大，调整字号即可；高分屏已自动做清晰化处理。",
                  bg=t["bg"], fg=t["sub"], font=F(9)).pack(anchor="w", pady=(10, 0))
+
+        # 助手安装根目录
+        tk.Label(wrap, text="助手安装根目录", bg=t["bg"], fg=t["fg"], font=F(13, True)).pack(
+            anchor="w", pady=(18, 2))
+        tk.Label(wrap,
+                 text="自动搜索启动器时优先扫描这个目录（部署向导里也可以设置）。"
+                      "留空则扫描所有固定硬盘的常见位置。",
+                 bg=t["bg"], fg=t["sub"], font=F(9), wraplength=720,
+                 justify="left").pack(anchor="w", pady=(0, 6))
+        srow = tk.Frame(wrap, bg=t["bg"]); srow.pack(fill="x")
+        tk.Entry(srow, textvariable=tk.StringVar(value=get_assistants_root(self.settings)),
+                 font=F(10), width=52, state="readonly", readonlybackground=t["panel"],
+                 fg=t["fg"], relief="flat").pack(side="left", ipady=4)
+        self._chip(srow, "修改…", self._settings_pick_root).pack(side="left", padx=(8, 0))
+        if get_assistants_root(self.settings):
+            self._chip(srow, "清除", self._settings_clear_root).pack(side="left", padx=(6, 0))
 
         # 日志自动保存
         tk.Label(wrap, text="日志自动保存", bg=t["bg"], fg=t["fg"], font=F(13, True)).pack(
@@ -1987,7 +2029,7 @@ class App(tk.Tk):
         if not script:
             return
         if quick:
-            roots = narrow_search_roots(BASE_DIR)
+            roots = narrow_search_roots(BASE_DIR, self.settings)
             path, src = resolve_launcher(script, self.settings, roots, allow_glob=False)
             candidates = [path] if path else []
             self._add_apply_scan_result(candidates, src, timed_out=False)
@@ -2002,9 +2044,10 @@ class App(tk.Tk):
 
         def worker():
             import time as _time
-            roots = default_search_roots(BASE_DIR)
+            roots = default_search_roots(BASE_DIR, self.settings)
             deadline_at = _time.monotonic() + 10
-            candidates = resolve_all_candidates(script, roots, max_results=8, timeout_sec=10)
+            candidates = resolve_all_candidates(script, roots, max_results=8, timeout_sec=10,
+                                                settings=self.settings)
             timed_out = _time.monotonic() >= deadline_at
             self.ui_queue.put(("scan", token, candidates, timed_out))
 
@@ -2138,11 +2181,12 @@ class App(tk.Tk):
     # ---------------- 首次向导 ----------------
     def build_first_run(self, root):
         t = self.t
-        tk.Label(root, text="欢迎使用一键长草助手", bg=t["bg"], fg=t["fg"],
+        tk.Label(root, text="部署向导", bg=t["bg"], fg=t["fg"],
                  font=F(22, True)).pack(anchor="w", padx=26, pady=(28, 8))
-        tk.Label(root, text="把多个游戏的自动脚本排队运行：一次只跑一个，跑完自动切换下一个。",
-                 bg=t["bg"], fg=t["sub"], font=F(11), anchor="w", wraplength=760).pack(
-                     anchor="w", padx=26, pady=(0, 12))
+        tk.Label(root, text="把多个游戏的自动脚本排队运行：一次只跑一个，跑完自动切换下一个。"
+                            "按下面卡片逐款完成：官方下载安装 → 导入 → 一键配置，绿勾即就绪。",
+                 bg=t["bg"], fg=t["sub"], font=F(11), anchor="w", wraplength=780).pack(
+                     anchor="w", padx=26, pady=(0, 10))
 
         wrap = tk.Frame(root, bg=t["bg"])
         wrap.pack(fill="both", expand=True, padx=26, pady=(0, 4))
@@ -2157,60 +2201,50 @@ class App(tk.Tk):
         cv.bind("<Configure>", lambda e: cv.itemconfig("fr_inner", width=e.width))
         self._bind_wheel(cv)
 
-        # 步骤 1：管理员权限
-        admin = runner_core.is_admin()
-        s1 = self._first_run_step_box(inner_wrap, "1. 管理员权限")
-        tk.Label(s1, text=("✓ 当前已是管理员模式，脚本启动更稳定。"
-                           if admin else "⚠ 建议关闭本程序，双击「启动助手.vbs」重新以管理员身份打开。"),
-                 bg=t["panel"], fg=(t["ok"] if admin else t["warn"]), font=F(10),
-                 anchor="w", wraplength=780, justify="left").pack(anchor="w", pady=(4, 2))
-
-        # 步骤 2：下载脚本
-        s2 = self._first_run_step_box(inner_wrap, "2. 下载并安装你要用的脚本")
-        tk.Label(s2, text="本助手只负责「排队启动」脚本，不含脚本本体。请点下方按钮到官方页下载，并解压/安装到本机。",
-                 bg=t["panel"], fg=t["sub"], font=F(10), anchor="w",
-                 wraplength=780, justify="left").pack(anchor="w", pady=(4, 6))
+        # 就绪进度总览
         try:
             games = pc.list_games(pc.load_catalog())
         except Exception:
             games = []
-        grid = tk.Frame(s2, bg=t["panel"])
-        grid.pack(anchor="w", fill="x")
-        for i, g in enumerate(games):
-            r, c = i // 2, i % 2
-            cell = tk.Frame(grid, bg=t["panel"])
-            cell.grid(row=r, column=c, sticky="w", padx=(0, 24), pady=3)
-            gname = g.get("name", "")
-            scripts = g.get("scripts", [])
-            sname = scripts[0].get("name", "") if scripts else ""
-            tk.Label(cell, text="· %s" % gname, bg=t["panel"], fg=t["fg"],
-                     font=F(10, True), anchor="w").pack(side="left")
-            if sname:
-                tk.Label(cell, text=" (%s)" % sname, bg=t["panel"], fg=t["sub"],
-                         font=F(10), anchor="w").pack(side="left")
-            dl = g.get("download_url") or g.get("doc_url")
-            if dl:
-                self._chip(cell, "↗ 官方下载", lambda u=dl: self._open_url(u)).pack(side="left", padx=(8, 0))
-            doc = g.get("doc_url")
-            if doc and doc != dl:
-                self._chip(cell, "使用文档", lambda u=doc: self._open_url(u)).pack(side="left", padx=(4, 0))
-
-        # 步骤 3：导入 + 路径自检
-        s3 = self._first_run_step_box(inner_wrap, "3. 导入配置并检测路径")
-        if self.plugins:
-            tk.Label(s3, text="已有 %d 个游戏配置。若还想追加内置四款，点下方按钮（已存在则跳过）。" % len(self.plugins),
-                     bg=t["panel"], fg=t["sub"], font=F(10), anchor="w",
-                     wraplength=780, justify="left").pack(anchor="w", pady=(4, 4))
+        imported = [g for g in games if self._wizard_plugin_for_game(g)]
+        ready = [g for g in imported
+                 if self._wizard_plugin_ready(self._wizard_plugin_for_game(g))]
+        prog = self._wizard_card(inner_wrap, "部署进度")
+        if imported:
+            ratio = float(len(ready)) / float(len(imported))
+            outer = tk.Frame(prog, bg=t["line"], height=8)
+            outer.pack(fill="x", pady=(2, 6))
+            if ratio > 0:
+                tk.Frame(outer, bg=t["accent"], height=8).place(
+                    relx=0, rely=0, relwidth=ratio, relheight=1)
+            note = "" if len(games) <= len(imported) else \
+                "，还有 %d 款未导入" % (len(games) - len(imported))
+            tk.Label(prog, text="已就绪 %d / %d 款已导入的助手%s" % (
+                len(ready), len(imported), note),
+                bg=t["panel"], fg=(t["ok"] if len(ready) == len(imported) else t["fg"]),
+                font=F(11, True), anchor="w").pack(anchor="w")
         else:
-            tk.Label(s3, text="点下方按钮一键导入 绝区零 / 原神 / 崩铁 / 明日方舟 四套预设，并自动检测启动器路径。",
-                     bg=t["panel"], fg=t["sub"], font=F(10), anchor="w",
-                     wraplength=780, justify="left").pack(anchor="w", pady=(4, 4))
-        self._pill(s3, "一键导入并检测路径", self._first_run_import, primary=True).pack(anchor="w", pady=(6, 4))
+            tk.Label(prog, text="还没有导入任何助手 —— 先点卡片上的「官方下载」安装，再点「导入此游戏」。",
+                     bg=t["panel"], fg=t["warn"], font=F(11, True), anchor="w",
+                     wraplength=720, justify="left").pack(anchor="w")
 
-        self._first_run_check_frame = tk.Frame(s3, bg=t["panel"])
-        self._first_run_check_frame.pack(fill="x", pady=(6, 0))
-        if self.plugins:
-            self._first_run_render_check()
+        # 助手安装根目录（可选，提高自动搜索命中率）
+        rootbox = self._wizard_card(inner_wrap, "助手安装根目录（可选）")
+        tk.Label(rootbox, text="如果几款助手都装在同一个文件夹，指定它，自动搜索路径会更准更快。",
+                 bg=t["panel"], fg=t["sub"], font=F(10), anchor="w",
+                 wraplength=720, justify="left").pack(anchor="w", pady=(2, 4))
+        erow = tk.Frame(rootbox, bg=t["panel"]); erow.pack(fill="x")
+        self._wizard_root_var = tk.StringVar(value=get_assistants_root(self.settings))
+        tk.Entry(erow, textvariable=self._wizard_root_var, font=F(10), width=52,
+                 bg=t["log_bg"], fg=t["log_fg"], insertbackground=t["fg"],
+                 relief="flat").pack(side="left", ipady=4)
+        self._chip(erow, "浏览…", self._wizard_pick_root).pack(side="left", padx=(8, 0))
+        if get_assistants_root(self.settings):
+            self._chip(erow, "清除", self._wizard_clear_root).pack(side="left", padx=(6, 0))
+
+        # 每款游戏一张卡片
+        for g in games:
+            self._wizard_game_card(inner_wrap, g)
 
         tk.Label(inner_wrap, text="使用即表示您已阅读并同意免责声明（见「使用帮助」或 DISCLAIMER.md）。",
                  bg=t["bg"], fg=t["warn"], font=F(9), anchor="w", wraplength=780).pack(
@@ -2218,17 +2252,40 @@ class App(tk.Tk):
 
         bf = tk.Frame(root, bg=t["bg"]); bf.pack(fill="x", padx=26, pady=(12, 20))
         self._pill(bf, "进入主页", self._first_run_finish, primary=True).pack(side="left")
-        self._chip(bf, "打开使用帮助", lambda: self.go("help", force=True)).pack(side="left", padx=10)
+        self._chip(bf, "一键导入常用四套", self._first_run_import).pack(side="left", padx=10)
+        self._chip(bf, "打开使用帮助", lambda: self.go("help", force=True)).pack(side="left")
 
-    def _first_run_step_box(self, parent, title):
+    def _wizard_card(self, parent, title, status_text="", status_color=None):
+        """向导卡片：标题 + 右侧状态徽标，返回内容容器。"""
         t = self.t
         box = tk.Frame(parent, bg=t["panel"], highlightthickness=1, highlightbackground=t["line"])
         box.pack(fill="x", pady=6, ipady=10)
         inner = tk.Frame(box, bg=t["panel"])
         inner.pack(fill="x", padx=20, pady=6)
-        tk.Label(inner, text=title, bg=t["panel"], fg=t["fg"], font=F(13, True),
-                 anchor="w").pack(anchor="w")
+        top = tk.Frame(inner, bg=t["panel"]); top.pack(fill="x")
+        tk.Label(top, text=title, bg=t["panel"], fg=t["fg"], font=F(13, True),
+                 anchor="w").pack(side="left")
+        if status_text:
+            tk.Label(top, text=status_text, bg=t["panel"],
+                     fg=status_color or t["sub"], font=F(10, True)).pack(side="right")
         return inner
+
+    def _wizard_plugin_for_game(self, game):
+        gid = game.get("id", "")
+        for p in self.plugins:
+            if p.get("preset_game_id", "") == gid:
+                return p
+        return None
+
+    def _wizard_plugin_ready(self, p, checks=None):
+        if not p:
+            return False
+        launcher = p.get("launcher", "")
+        if not launcher or not os.path.isfile(launcher):
+            return False
+        if checks is None:
+            checks = assistant_setup.verify_for_plugin(p)
+        return bool(checks) and all(c.get("ok") for c in checks)
 
     def _open_url(self, url):
         if not url:
@@ -2242,62 +2299,248 @@ class App(tk.Tk):
             except Exception:
                 pass
 
-    def _first_run_render_check(self):
-        """在首次向导第 3 步内渲染当前所有插件的路径检测结果。"""
-        if not hasattr(self, "_first_run_check_frame"):
-            return
-        frame = self._first_run_check_frame
-        if not frame.winfo_exists():
-            return
-        for w in frame.winfo_children():
-            w.destroy()
+    def _wizard_game_card(self, parent, game):
         t = self.t
-        if not self.plugins:
+        gname = game.get("name", "")
+        scripts = game.get("scripts", [])
+        sname = scripts[0].get("name", "") if scripts else ""
+        p = self._wizard_plugin_for_game(game)
+        title = ("%s · %s" % (gname, sname)) if sname else gname
+
+        if p is None:
+            inner = self._wizard_card(parent, title, "未导入", t["sub"])
+            tk.Label(inner, text="还没使用这款脚本？点「官方下载」安装好后再点「导入此游戏」。",
+                     bg=t["panel"], fg=t["sub"], font=F(10), anchor="w",
+                     wraplength=720, justify="left").pack(anchor="w", pady=(2, 2))
+            btns = tk.Frame(inner, bg=t["panel"]); btns.pack(fill="x", pady=(2, 0))
+            self._pill(btns, "导入此游戏并检测路径",
+                       lambda g=game: self._wizard_import_game(g)).pack(side="left")
+            self._wizard_dl_buttons(btns, game, first_padx=10)
             return
+
+        launcher_ok = bool(p.get("launcher")) and os.path.isfile(p.get("launcher", ""))
+        supported = p.get("preset_id", "") in assistant_setup.SUPPORTED_PRESET_IDS
+        checks = assistant_setup.verify_for_plugin(p) if launcher_ok else []
+        ready = self._wizard_plugin_ready(p, checks)
+        status = "✓ 就绪" if ready else ("待设置路径" if not launcher_ok else "待配置")
+        color = t["ok"] if ready else (t["warn"] if launcher_ok else t["err"])
+        inner = self._wizard_card(parent, title, status, color)
+
+        if launcher_ok and checks:
+            for c in checks:
+                row = tk.Frame(inner, bg=t["panel"]); row.pack(fill="x", pady=1)
+                tk.Label(row, text=("✓" if c.get("ok") else "△"), bg=t["panel"],
+                         fg=(t["ok"] if c.get("ok") else t["warn"]),
+                         font=F(10, True)).pack(side="left")
+                tk.Label(row, text=c.get("name", ""), bg=t["panel"], fg=t["fg"],
+                         font=F(10), anchor="w").pack(side="left", padx=(6, 0))
+                if c.get("hint"):
+                    tk.Label(row, text="（%s）" % c["hint"], bg=t["panel"], fg=t["sub"],
+                             font=F(9), anchor="w", wraplength=560,
+                             justify="left").pack(side="left", padx=(4, 0))
+        elif not launcher_ok:
+            tk.Label(inner, text="还没找到启动器程序 —— 先安装助手，再点「重新检测」；"
+                                 "装在冷门位置就点「浏览…」手动指定。",
+                     bg=t["panel"], fg=t["sub"], font=F(10), anchor="w",
+                     wraplength=720, justify="left").pack(anchor="w", pady=(2, 0))
+
+        # 一键配置后的结果回显
+        res = getattr(self, "_wizard_result", {}).get(p.get("preset_id", ""))
+        if res:
+            rbox = tk.Frame(inner, bg=t["panel"]); rbox.pack(fill="x", pady=(4, 0))
+            if res.get("applied"):
+                tk.Label(rbox, text="✓ 已自动写入：%s" % "、".join(res["applied"]),
+                         bg=t["panel"], fg=t["ok"], font=F(10), anchor="w",
+                         wraplength=700, justify="left").pack(anchor="w")
+            if res.get("error"):
+                tk.Label(rbox, text=res["error"], bg=t["panel"], fg=t["err"],
+                         font=F(10), anchor="w", wraplength=700,
+                         justify="left").pack(anchor="w")
+            for m in res.get("manual") or []:
+                tk.Label(rbox, text="△ 还需人工：%s" % m, bg=t["panel"], fg=t["warn"],
+                         font=F(10), anchor="w", wraplength=700,
+                         justify="left").pack(anchor="w")
+
+        btns = tk.Frame(inner, bg=t["panel"]); btns.pack(fill="x", pady=(6, 0))
+        if launcher_ok and supported:
+            self._pill(btns, "一键配置", lambda pl=p: self._wizard_apply_setup(pl)).pack(side="left")
+        if launcher_ok:
+            self._chip(btns, "重新检测", lambda pl=p: self._wizard_rescan(pl)).pack(side="left", padx=(8, 0))
+            self._chip(btns, "浏览…", lambda pl=p: self._wizard_browse(pl)).pack(side="left", padx=(6, 0))
+            self._chip(btns, "编辑", lambda pl=p: self.open_edit(pl)).pack(side="left", padx=(6, 0))
+            if assistant_setup.list_backups(p.get("preset_id", "")):
+                self._chip(btns, "还原备份", lambda pl=p: self._wizard_restore(pl)).pack(
+                    side="left", padx=(6, 0))
+        self._wizard_dl_buttons(btns, game, first_padx=8)
+
+    def _wizard_dl_buttons(self, parent, game, first_padx=8):
+        dl = game.get("download_url") or game.get("doc_url")
+        if dl:
+            self._chip(parent, "↗ 官方下载", lambda u=dl: self._open_url(u)).pack(
+                side="left", padx=(first_padx, 0))
+        doc = game.get("doc_url")
+        if doc and doc != dl:
+            self._chip(parent, "使用文档", lambda u=doc: self._open_url(u)).pack(
+                side="left", padx=(6, 0))
+
+    def _wizard_import_game(self, game):
+        gid = game.get("id", "")
+        scripts = game.get("scripts", [])
+        sid = scripts[0].get("id", "") if scripts else ""
         try:
-            catalog = pc.load_catalog()
-        except Exception:
-            catalog = {"games": []}
-
-        missing = []
-        ok_count = 0
-        for p in self.plugins:
-            launcher = p.get("launcher", "")
-            if launcher and os.path.isfile(launcher):
-                ok_count += 1
-            else:
-                missing.append(p)
-
-        summary = "路径检测：%d 个已就绪，%d 个待设置。" % (ok_count, len(missing))
-        color = t["ok"] if not missing else t["warn"]
-        tk.Label(frame, text=summary, bg=t["panel"], fg=color, font=F(10, True),
-                 anchor="w").pack(anchor="w", pady=(6, 2))
-
-        if not missing:
-            tk.Label(frame, text="✓ 全部启动器路径都能自动找到，可以直接进入主页。",
-                     bg=t["panel"], fg=t["sub"], font=F(9), anchor="w",
-                     wraplength=780, justify="left").pack(anchor="w", pady=(0, 4))
+            plugin = pc.resolve_and_build(gid, sid, self.settings)
+        except Exception as e:
+            messagebox.showerror("导入失败", str(e), parent=self)
             return
+        if not plugin.get("launcher"):
+            go_on = messagebox.askyesno(
+                "未找到启动器",
+                "没有自动找到 %s 的启动器。\n\n已安装好了？点「是」手动选择启动器程序；\n"
+                "还没安装？点「否」，先点「官方下载」安装后再来导入。" % game.get("name", ""),
+                parent=self)
+            if not go_on:
+                return
+            override = filedialog.askopenfilename(title="选择启动器程序（exe）", parent=self)
+            if not override:
+                return
+            try:
+                plugin = pc.resolve_and_build(gid, sid, self.settings,
+                                              launcher_override=override)
+            except Exception as e:
+                messagebox.showerror("导入失败", str(e), parent=self)
+                return
+        pc.save_plugin_file(plugin)
+        if plugin.get("launcher"):
+            update_path_cache(self.settings, sid, plugin.get("launcher"))
+            save_settings(self.settings)
+        self.reload()
+        self.go("first_run", force=True)
 
-        tk.Label(frame, text="以下游戏没有找到启动器 —— 通常是因为还没安装，或安装在不常见的位置：",
-                 bg=t["panel"], fg=t["sub"], font=F(9), anchor="w",
-                 wraplength=780, justify="left").pack(anchor="w", pady=(0, 4))
+    def _wizard_apply_setup(self, plugin):
+        r = assistant_setup.apply_for_plugin(plugin)
+        if not hasattr(self, "_wizard_result"):
+            self._wizard_result = {}
+        self._wizard_result[plugin.get("preset_id", "")] = r
+        if r.get("ok") and r.get("applied"):
+            self._enqueue_log("「%s」已写入推荐配置：%s" % (
+                plugin.get("name", ""), "、".join(r["applied"])), level="info")
+        self.go("first_run", force=True)
 
-        for p in missing:
-            row = tk.Frame(frame, bg=t["panel"])
-            row.pack(fill="x", pady=2)
-            tk.Label(row, text="· %s" % p.get("name", ""), bg=t["panel"], fg=t["fg"],
-                     font=F(10), anchor="w").pack(side="left")
+    def _wizard_rescan(self, plugin):
+        pid = plugin.get("preset_id", "")
+        script = None
+        try:
+            script = pc.find_script_by_preset_id(pc.load_catalog(), pid)
+        except Exception:
+            script = None
+        if not script:
+            messagebox.showinfo("重新检测", "没有这款脚本的预设信息，请点「浏览…」手动指定。",
+                                parent=self)
+            return
+        self._wizard_scan_token = getattr(self, "_wizard_scan_token", 0) + 1
+        token = self._wizard_scan_token
 
-            game_id = p.get("preset_game_id", "")
-            game = pc.get_game(catalog, game_id) if game_id else None
-            dl = ""
-            if game:
-                dl = game.get("download_url") or game.get("doc_url") or ""
+        def worker():
+            roots = default_search_roots(BASE_DIR, self.settings)
+            candidates = resolve_all_candidates(script, roots, max_results=5,
+                                                timeout_sec=10, settings=self.settings)
+            self.ui_queue.put(("wizard_scan", token, pid, candidates, False))
 
-            if dl:
-                self._chip(row, "↗ 下载", lambda u=dl: self._open_url(u)).pack(side="left", padx=(8, 0))
-            self._chip(row, "手动指定路径", lambda pl=p: self.open_edit(pl)).pack(side="left", padx=(6, 0))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _wizard_apply_scan(self, token, preset_id, candidates, timed_out):
+        if token != getattr(self, "_wizard_scan_token", -1):
+            return
+        p = next((x for x in self.plugins if x.get("preset_id", "") == preset_id), None)
+        if not p:
+            return
+        if candidates:
+            path = os.path.normpath(candidates[0])
+            p["launcher"] = path
+            save_plugin(p)
+            update_path_cache(self.settings, preset_id, path)
+            save_settings(self.settings)
+            self.reload()
+            self._enqueue_log("「%s」已自动定位启动器：%s" % (p.get("name", ""), path),
+                              level="info")
+        else:
+            messagebox.showinfo(
+                "未找到启动器",
+                "自动搜索没有找到「%s」的启动器。\n\n"
+                "确认已安装后，点「浏览…」手动选择安装目录里的启动器程序；\n"
+                "或者先在上方设置「助手安装根目录」再重新检测。" % p.get("name", ""),
+                parent=self)
+            return
+        self.go("first_run", force=True)
+
+    def _wizard_browse(self, plugin):
+        init = get_assistants_root(self.settings)
+        if not init or not os.path.isdir(init):
+            cur = plugin.get("launcher", "") or ""
+            d = os.path.dirname(cur)
+            init = d if d and os.path.isdir(d) else BASE_DIR
+        picked = filedialog.askopenfilename(title="选择启动器程序（exe）",
+                                            initialdir=init, parent=self)
+        if not picked:
+            return
+        plugin["launcher"] = os.path.normpath(picked)
+        save_plugin(plugin)
+        update_path_cache(self.settings, plugin.get("preset_id", ""), plugin["launcher"])
+        save_settings(self.settings)
+        self.reload()
+        self.go("first_run", force=True)
+
+    def _wizard_restore(self, plugin):
+        pid = plugin.get("preset_id", "")
+        backups = assistant_setup.list_backups(pid)
+        if not backups:
+            messagebox.showinfo("还原备份", "没有可还原的备份。", parent=self)
+            return
+        latest, name = backups[0]
+        if not messagebox.askyesno(
+                "还原备份",
+                "把「%s」的配置恢复到最近一次一键配置之前的备份？\n\n备份时间：%s\n当前配置会被覆盖。"
+                % (plugin.get("name", ""), assistant_setup.backup_time_label(latest)),
+                parent=self):
+            return
+        files = assistant_setup.restore_backup(latest)
+        if files:
+            messagebox.showinfo("还原备份",
+                                "已还原 %d 个文件：\n%s" % (
+                                    len(files),
+                                    "\n".join(os.path.basename(f) for f in files)),
+                                parent=self)
+            self._enqueue_log("「%s」已还原一键配置备份（%s）" % (
+                plugin.get("name", ""), name), level="info")
+        else:
+            messagebox.showerror("还原备份", "还原失败，请检查文件是否被占用。", parent=self)
+        self.go("first_run", force=True)
+
+    def _wizard_pick_root(self):
+        d = filedialog.askdirectory(title="选择助手安装根目录", parent=self)
+        if not d:
+            return
+        self.settings["assistants_root"] = os.path.normpath(d)
+        save_settings(self.settings)
+        self.go("first_run", force=True)
+
+    def _wizard_clear_root(self):
+        self.settings["assistants_root"] = ""
+        save_settings(self.settings)
+        self.go("first_run", force=True)
+
+    def _settings_pick_root(self):
+        d = filedialog.askdirectory(title="选择助手安装根目录", parent=self)
+        if not d:
+            return
+        self.settings["assistants_root"] = os.path.normpath(d)
+        save_settings(self.settings)
+        self.go("settings", force=True)
+
+    def _settings_clear_root(self):
+        self.settings["assistants_root"] = ""
+        save_settings(self.settings)
+        self.go("settings", force=True)
 
     def _first_run_import(self):
         pc.import_default_plugins(self.settings)
@@ -2352,16 +2595,19 @@ class App(tk.Tk):
         total = int(self.run_state.get("total", 0) or 0)
         name = self.run_state.get("name", "")
         message = self.run_state.get("message", "") or "就绪"
+        parallel_names = self.run_state.get("parallel_names") or []
+        if parallel_names:
+            message = "%s · ⇉ 并行：%s" % (message, "、".join(parallel_names))
         if self._preflight_busy:
             title, detail, color = "正在运行前检查", "检查路径、权限和进程占用…", t["accent"]
         elif state in ("running", "stopping"):
-            title = ("%d/%d  %s" % (index, total, name)) if total else (name or "串行任务运行中")
+            title = ("%d/%d  %s" % (index, total, name)) if total else (name or "任务运行中")
             detail = message
             color = t["warn"] if state == "stopping" else t["ok"]
         elif state == "finished":
-            title, detail, color = "本轮串行任务已结束", message, t["sub"]
+            title, detail, color = "本轮任务已结束", message, t["sub"]
         else:
-            title, detail, color = "串行任务未运行", "准备好后可在任意页面开始", t["sub"]
+            title, detail, color = "任务未运行", "准备好后可在任意页面开始", t["sub"]
         self.global_run_title.config(text=title)
         self.global_run_detail.config(text=" · " + detail)
         self.global_state_dot.config(fg=color)
@@ -2420,7 +2666,8 @@ class App(tk.Tk):
         self._run_tasks = []
         self.run_state = {
             "state": "running", "index": 0, "total": len(active),
-            "name": "", "message": "正在启动串行任务", "result": None,
+            "name": "", "message": "正在启动任务队列", "result": None,
+            "parallel_names": [],
         }
         self._refresh_run_buttons()
 
@@ -2455,14 +2702,39 @@ class App(tk.Tk):
     def _apply_run_event(self, event):
         kind = event.get("type")
         active_state = "stopping" if self.stop_event.is_set() else "running"
+        parallel_names = self.run_state.setdefault("parallel_names", [])
         if kind == "queue_started":
+            n_parallel = int(event.get("parallel_total", 0) or 0)
             self.run_state.update(state=active_state, total=event.get("total", 0),
-                                  index=0, message="串行队列已开始")
+                                  index=0, parallel_names=[],
+                                  message=("任务队列已开始（并行 %d 个）" % n_parallel)
+                                  if n_parallel else "任务队列已开始")
+        elif kind == "task_started" and event.get("parallel"):
+            name = event.get("name", "")
+            if name and name not in parallel_names:
+                parallel_names.append(name)
+            self.run_state.update(state=active_state,
+                                  message="并行任务「%s」启动" % name)
+        elif kind == "task_finished" and event.get("parallel"):
+            name = event.get("name", "")
+            if name in parallel_names:
+                parallel_names.remove(name)
+            result = event.get("result", "")
+            stored = result
+            if stored == "completed":
+                stored = event.get("task_status") or stored
+            self._run_tasks.append((name, stored))
+            labels = {"completed": "已完成", "skipped": "已跳过",
+                      "failed": "启动失败", "stopped": "已停止"}
+            self.run_state.update(state=active_state,
+                                  message="并行任务「%s」%s" % (name, labels.get(result, "已结束")))
         elif kind == "task_started":
             self.run_state.update(state=active_state, index=event.get("index", 0),
                                   total=event.get("total", 0), name=event.get("name", ""),
                                   message="正在检查配置")
         elif kind == "stage_changed":
+            if event.get("parallel"):
+                return  # 并行任务不占据运行栏标题位
             self.run_state.update(state=active_state, index=event.get("index", 0),
                                   total=event.get("total", 0), name=event.get("name", ""),
                                   message=event.get("message", "运行中"))
@@ -2480,7 +2752,10 @@ class App(tk.Tk):
         elif kind == "queue_finished":
             result = event.get("result", "completed")
             self.run_state.update(state="finished", result=result,
-                                  message=("用户已停止本轮任务" if result == "stopped" else "全部任务执行完成"))
+                                  index=int(self.run_state.get("total", 0) or 0),
+                                  parallel_names=[],
+                                  message=("用户已停止本轮任务" if result == "stopped"
+                                           else "全部任务执行完成"))
         self._update_global_run_bar()
 
     def _log_tag_for(self, msg, level=None):
@@ -2643,6 +2918,8 @@ class App(tk.Tk):
                     self._finish_preflight(item[1], item[2], item[3])
                 elif kind == "scan":
                     self._apply_scan_result(item[1], item[2], item[3])
+                elif kind == "wizard_scan":
+                    self._wizard_apply_scan(item[1], item[2], item[3], item[4])
                 elif kind == "run_event":
                     self._apply_run_event(item[1])
                 if (time.perf_counter() - start) >= 0.012:
