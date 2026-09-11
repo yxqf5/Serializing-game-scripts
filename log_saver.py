@@ -24,6 +24,7 @@ RETENTION_OPTIONS = {"week": 7, "month": 30, "forever": None}
 # 运行结果 → 显示文案 / 任务标记
 _RESULT_LABELS = {
     "completed": "全部完成",
+    "partial": "部分未完成",
     "stopped": "用户停止",
     "failed": "启动失败",
     "skipped": "已跳过",

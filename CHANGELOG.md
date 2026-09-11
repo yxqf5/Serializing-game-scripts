@@ -5,6 +5,51 @@
 
 ---
 
+## 2026-09-12 · 日志模块加固：保存缓冲 / 轮转守卫 / 读取上限 / 尾部解码
+
+背景：日志模块全面审查（log_watcher / log_saver / runner_core 日志链路 / 界面日志区）后修复 4 个问题。核心链路（线程队列、增量读取、编码兜底、原子落盘、并行线程安全）审查确认健壮，本次均为防御性加固。
+
+### 1. 自动保存的 md 不再静默截断（游戏助手.pyw）
+
+- 旧行为：`_save_run_log`/`_export_log` 直接取界面 LogStore（1 万行上限，超出丢最旧），md 无任何标注；脚本刷屏时最早的游戏失败证据恰会缺失；运行中点「清空日志」还会把前半段从 md 里抹掉
+- 新增**保存专用缓冲** `_run_log_buffer`（上限 `RUN_LOG_BUFFER_MAX=50000` 行），与界面显示分离：md 取自缓冲，运行中清空只清界面不清缓冲；超限时 md 头部注入「⚠ 本次运行日志共约 N 行，较早的 M 行已省略」
+- md 标题修正：有任务未完成的一轮不再标「全部完成」，改用新增的 `partial → 部分未完成` 标签（log_saver `_RESULT_LABELS`）
+
+### 2. 日志轮转跟随守卫（log_watcher.py）
+
+- 旧风险：`poll()` 按 mtime 取 glob 里最新文件并从头读——运行中若有**旧**日志被外部触碰（其他实例/编辑器/同步盘），watcher 会切过去把整份旧日志当成本次新增行，旧关键词混入证据造成误判
+- 新增 `_should_follow()`：只跟随创建时间（getctime）晚于本次 `start()` 时刻（容差 2 秒）的文件；当前文件已不存在时强制跟随避免监控中断
+
+### 3. 单次 poll 读取上限（log_watcher.py）
+
+- `f.read()` 加 `MAX_POLL_READ=8MB` 上限、`_offset` 按实际读入量推进：脚本异常倾泻超大日志时分批消化，不再有内存峰值
+
+### 4. 尾部残留字节按配置编码容错解码（log_watcher.py）
+
+- `_flush_tail` 原硬编码 utf-8 replace；新增 `_decode_lossy()` 按 `_encodings()` 顺序解码。实际影响极小（流末残留必是不完整多字节序列），属正确性修正
+
+### 5. 监控提示语与跟随可见性（runner_core.py）
+
+- glob 监控的初始提示加「（脚本新建日志时会自动跟随）」注（启动前探测到的多半是前一天的文件，纯显示问题但易误解）
+- 游戏模式确认游戏已启动后，若监控已切换文件则输出「[日志] 已跟随到脚本日志：路径」；导入日志查看器对超大文件只展示最后 2 万行并标注
+
+### 测试
+
+- `tests/test_log_watcher.py` 新增 5 项：跟随守卫（旧 ctime 拒绝/新 ctime 跟随/当前文件消失强制跟随）、旧文件被触碰不误读、新会话文件正常跟随、读取上限分批消化、`_decode_lossy`；全套 **144 项通过**
+
+---
+
+## 2026-09-12 · 修复：明日方舟检测项误报（MAA v6 新格式 gui.new.json）
+
+背景：用户反馈向导里明日方舟一键配置出现「已配置模拟器连接（ADB 路径）」报警。排查结论：**误报**。本机 MAA 已从 v5 原地自更新到 v6.17.5（目录名仍是 MAA-v5.16.8），v6 把配置从 `gui.json`（点号键扁平、值为字符串）整体迁移到 `gui.new.json`（`Configurations.<名>.Gui` 嵌套：`StartUpSettings.RunDirectly/StartEmulator` 布尔、`PostActions` 为 `"ExitEmulator, ExitSelf"` 字符串、连接在 `ConnectSettings.AdbPath`），而 handler 只读旧文件。此前「MAA 配置被重置、串行已断」的判断**有误**——设置是迁移而非丢失，本机新格式里连接/启动/收尾全齐。
+
+方案：`_setup_maa` 拆为双格式——`gui.new.json` 存在且可解析时走 `_maa_setup_new`（写 `RunDirectly=True`、`StartEmulator=True` 布尔，`PostActions` 补成含 `ExitEmulator`+`ExitSelf` 的字符串，ADB 自检读 `ConnectSettings.AdbPath`）；解析失败或文件不存在回退 `_maa_setup_old`（原 gui.json 逻辑不动）。备份/还原、dry-run 语义不变。
+
+- `tests/test_assistant_setup.py` 新增 `TestMaaNewFormat` 6 项（新格式写入/幂等/dry-run 不落盘/新文件优先且不动旧文件/坏新文件回退旧格式/ADB 缺失报警），全套 139 项通过
+- 注：本次修复前误写入旧 gui.json 的三个点号键无害保留（旧版回滚场景仍有效）；本机 MAA 无需任何人工操作
+
+---
+
 ## 2026-09-12 · 新功能：部署向导 2.0 + 助手配置一键写入（面向零基础分发）
 
 背景：exe 虽已可直接双击，但用户拿到的 90% 门槛在「安装并配置 4-5 个第三方助手」——March7th 要改 config.yaml、MAA 要勾三个开关、MaaEnd 要在任务队列末尾加收尾任务、BetterGI 要设一条龙结束操作。小白无法独立完成。目标：exe 发给零基础用户后，不碰任何配置文件、不敲任何命令即可用起来。用户决策：只发 exe+说明（不做整合包）；允许自动写入第三方配置（备份可还原）；先支持当前 5 款。

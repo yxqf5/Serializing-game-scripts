@@ -11,6 +11,7 @@
 """
 
 import os
+import glob
 import json
 import time
 import threading
@@ -502,6 +503,7 @@ class Runner:
         helper_procs = p.get("helper_processes", [])
 
         watcher = self._start_log_watcher(p)
+        watcher_start_path = watcher.path if watcher else None
         tick = watcher.poll if watcher else None
 
         if wait_mode == "helper":
@@ -532,6 +534,9 @@ class Runner:
         elif not stopped:
             self._stage("running", "游戏运行中，等待任务完成", **event_base)
             self._tlog("[运行] 游戏已启动，等待助手完成并关闭游戏...")
+            # 启动前探测的多半是旧日志，游戏起来后监控应已跟随到当天新文件
+            if watcher is not None and watcher.path and watcher.path != watcher_start_path:
+                self._tlog("[日志] 已跟随到脚本日志：%s" % watcher.path)
             self._wait_until_all_gone(game_procs, on_tick=tick)
             stopped = self._stopped()
         task_status = self._report_task_result(p, watcher)
@@ -599,7 +604,10 @@ class Runner:
             stamina_patterns=p.get("stamina_patterns") or [],
         )
         if watcher.start():
-            self._tlog("[日志] 正在监控脚本日志：%s" % watcher.path)
+            # glob 监控显示的是启动前探测到的文件（当天新日志多半还没生成），
+            # 运行中会自动跟随到新文件，注明避免用户误解。
+            note = "（脚本新建日志时会自动跟随）" if glob.has_magic(p.get("log_file") or "") else ""
+            self._tlog("[日志] 正在监控脚本日志：%s%s" % (watcher.path, note))
             return watcher
         self._tlog("[日志] 未找到日志文件：%s" % p.get("log_file"))
         return None

@@ -44,6 +44,8 @@ SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 # 各游戏最近一次判定「已完成」的时间（同服务器日重复运行判重用）
 DAILY_STATE_FILE = os.path.join(BASE_DIR, "daily_state.json")
+# 自动保存/导出用的完整日志缓冲上限（界面显示另受 LogStore 1 万行限制）
+RUN_LOG_BUFFER_MAX = 50000
 APP_ICON_PNG = resource_path("assets", "icons", "app.png")
 APP_ICON_ICO = resource_path("assets", "icons", "app.ico")
 import runner_core
@@ -103,6 +105,9 @@ FONT_FAMILIES = ["微软雅黑", "Microsoft YaHei UI", "黑体", "等线", "宋�
 # 字体全局参数（由 App 设置）
 _FAMILY = "微软雅黑"
 _SCALE = 1.0
+
+# 日志区界面内最多保留的行数；完整内容仍在 LogStore，可导出/复制全部
+LOG_VIEW_LINES = 600
 
 
 def F(size=11, bold=False):
@@ -217,6 +222,10 @@ class App(tk.Tk):
         self._tooltip_job = None
         self._run_started_at = None   # 本轮运行开始时间（自动保存日志用）
         self._run_tasks = []          # 本轮每个游戏的执行结果 [(name, result)]
+        # 保存专用缓冲：md 日志取自这里而非界面 LogStore（后者 1 万行上限
+        # 会静默丢最旧行），运行中「清空日志」也不影响已记录的内容
+        self._run_log_buffer = []     # [(text, level), ...]
+        self._run_log_dropped = 0     # 缓冲超限被丢弃的行数
 
         self.configure(bg=self.t["bg"])
         os.makedirs(PLUGIN_DIR, exist_ok=True)
@@ -665,7 +674,9 @@ class App(tk.Tk):
         self.log_widget = tk.Text(
             body, bg=t["log_bg"], fg=t["log_fg"], insertbackground=t["fg"],
             selectbackground=t["accent"], selectforeground=t["on_accent"],
-            font=("Consolas", max(9, int(round(10 * _SCALE)))), relief="flat",
+            # 必须用原生含中文字形的字体：Consolas 遇中文走 GDI 字体回退链，
+            # 窗口缩放时全量重排一次要数百毫秒（实测），是拉伸卡顿的主因
+            font=(_FAMILY, max(9, int(round(10 * _SCALE)))), relief="flat",
             wrap="word", padx=12, pady=9, bd=0, undo=False,
         )
         sb = ttk.Scrollbar(body, orient="vertical", command=self._log_yview, style="Vert.TScrollbar")
@@ -749,23 +760,43 @@ class App(tk.Tk):
             except Exception:
                 break
 
+    def _throttle(self, attr, ms, func):
+        """合并高频事件：至多每 ms 毫秒执行一次，停止后补执行最后一次。
+
+        拖拽缩放时 Configure 逐像素触发，逐像素重排卡片代价太高；
+        节流后内容仍以约 12 次/秒跟随窗口变化。
+        """
+        job = getattr(self, attr, None)
+        if job:
+            self.after_cancel(job)
+        wait = ms - (time.monotonic() - getattr(self, attr + "_last", 0.0)) * 1000.0
+        if wait <= 0:
+            setattr(self, attr + "_last", time.monotonic())
+            func()
+            return
+
+        def fire():
+            setattr(self, attr, None)
+            setattr(self, attr + "_last", time.monotonic())
+            func()
+
+        setattr(self, attr, self.after(int(wait), fire))
+
     def _on_list_canvas_configure(self, event=None):
+        if not hasattr(self, "canvas") or not self.canvas.winfo_exists():
+            return
+        self._throttle("_card_layout", 80, self._apply_card_layout)
+
+    def _apply_card_layout(self):
         if not hasattr(self, "canvas") or not self.canvas.winfo_exists():
             return
         cw = self.canvas.winfo_width()
         if cw and cw != getattr(self, "_canvas_w", None):
             self._canvas_w = cw
             self.canvas.itemconfig("inner", width=cw)
-        # 缩放窗口时 Configure 连续触发，合并到空闲时一次性处理。
-        if not getattr(self, "_wrap_sync_job", None):
-            self._wrap_sync_job = self.after_idle(self._do_sync_card_wraplength)
-
-    def _sync_card_wraplength(self):
-        if not getattr(self, "_wrap_sync_job", None):
-            self._wrap_sync_job = self.after_idle(self._do_sync_card_wraplength)
+        self._do_sync_card_wraplength()
 
     def _do_sync_card_wraplength(self):
-        self._wrap_sync_job = None
         if not hasattr(self, "canvas") or not self.canvas.winfo_exists():
             return
         cw = self.canvas.winfo_width()
@@ -882,6 +913,19 @@ class App(tk.Tk):
             tk.Label(inner, text="  |  ⚠ 非管理员模式", bg=t["panel"], fg=t["warn"],
                      font=F(9), anchor="w").pack(side="left")
 
+    def _card_status(self, p):
+        """卡片状态行文字与颜色（主页 ⇉ 并行开关就地刷新时也要用它）。"""
+        t = self.t
+        ok = self._path_exists(p.get("launcher", ""))
+        pending = pc.pending_checklist_count(p)
+        text = "✓ 就绪" if ok else "✗ 路径无效"
+        if pending:
+            text += "  ·  ⚠ %d 项待办" % pending
+        if p.get("parallel"):
+            text += "  ·  ⇉ 并行"
+        color = t["err"] if not ok else (t["warn"] if pending else t["ok"])
+        return text, color
+
     def _card(self, idx, p):
         t = self.t
         enabled = bool(p.get("enabled", True))
@@ -923,15 +967,9 @@ class App(tk.Tk):
         self._attach_tooltip(name_lbl, full_name)
 
         launcher = p.get("launcher", "")
-        ok = self._path_exists(launcher)
-        pending = pc.pending_checklist_count(p)
-        status_text = "✓ 就绪" if ok else "✗ 路径无效"
-        if pending:
-            status_text += "  ·  ⚠ %d 项待办" % pending
-        if p.get("parallel"):
-            status_text += "  ·  ⇉ 并行"
+        status_text, status_color = self._card_status(p)
         st_lbl = tk.Label(mid, text=status_text, bg=panel,
-                          fg=(t["err"] if not ok else (t["warn"] if pending else t["ok"])),
+                          fg=status_color,
                           font=F(9), anchor="w", justify="left")
         st_lbl.grid(row=1, column=0, sticky="w", padx=(0, 10))
 
@@ -2664,6 +2702,8 @@ class App(tk.Tk):
         self.running = True
         self._run_started_at = datetime.datetime.now()
         self._run_tasks = []
+        self._run_log_buffer = []
+        self._run_log_dropped = 0
         self.run_state = {
             "state": "running", "index": 0, "total": len(active),
             "name": "", "message": "正在启动任务队列", "result": None,
@@ -2793,7 +2833,8 @@ class App(tk.Tk):
         self._log_inserting = True
         self.log_widget.config(state="normal")
         self.log_widget.delete("1.0", "end")
-        for tag, payload in group_tagged_lines(self.log_store.lines, self._log_tag_for):
+        view = self.log_store.lines[-LOG_VIEW_LINES:]
+        for tag, payload in group_tagged_lines(view, self._log_tag_for):
             self.log_widget.insert("end", payload, tag or ())
         self.log_widget.config(state="disabled")
         if self.log_follow:
@@ -2811,6 +2852,12 @@ class App(tk.Tk):
             self.log_widget.delete("1.0", "%d.0" % (overflow + 1))
         for tag, payload in group_tagged_lines(lines, self._log_tag_for):
             self.log_widget.insert("end", payload, tag or ())
+        # 界面内只保留最近 LOG_VIEW_LINES 行（须在 state=normal 下删，disabled
+        # 会静默无效），越界头部整行裁掉；窗口缩放的重排开销随行数下降
+        view_lines = int(float(self.log_widget.index("end-1c")))
+        extra = view_lines - LOG_VIEW_LINES
+        if extra > 0:
+            self.log_widget.delete("1.0", "%d.0" % (extra + 1))
         self.log_widget.config(state="disabled")
         if self.log_follow:
             self.log_widget.see("end")
@@ -2945,6 +2992,11 @@ class App(tk.Tk):
         if lines:
             overflow = self.log_store.append_many(lines)
             self._insert_log_batch(lines, overflow)
+            self._run_log_buffer.extend(lines)
+            excess = len(self._run_log_buffer) - RUN_LOG_BUFFER_MAX
+            if excess > 0:
+                del self._run_log_buffer[:excess]
+                self._run_log_dropped += excess
         if done:
             self.running = False
             if self.run_state.get("state") not in ("finished",):
@@ -2965,8 +3017,14 @@ class App(tk.Tk):
         if self._run_started_at is None:
             return
         try:
-            lines = [text for text, _ in self.log_store.lines]
+            lines = [text for text, _ in self._run_log_buffer]
+            if self._run_log_dropped:
+                lines.insert(0, "⚠ 本次运行日志共约 %d 行，超过保留上限，较早的 %d 行已省略。"
+                             % (self._run_log_dropped + len(lines), self._run_log_dropped))
             result = self.run_state.get("result") or "completed"
+            if result == "completed" and self._run_tasks and any(
+                    r != "completed" for _, r in self._run_tasks):
+                result = "partial"   # md 标题不再把有未完成的一轮标成「全部完成」
             end_dt = datetime.datetime.now()
             record_no = log_saver.today_record_count(LOG_DIR, now=end_dt) + 1
             record = log_saver.build_run_markdown(
@@ -3006,6 +3064,12 @@ class App(tk.Tk):
             except OSError as e:
                 messagebox.showerror("导入失败", str(e), parent=self)
                 return
+        # 超大文件只保留尾部展示，避免查看窗口一次性插入卡死界面
+        view_lines = text.splitlines()
+        if len(view_lines) > 20000:
+            view_lines = view_lines[-20000:]
+            view_lines.insert(0, "⚠ 文件过大（共 %d 行），仅显示最后 20000 行。" % len(text.splitlines()))
+            text = "\n".join(view_lines)
         self._show_log_viewer(os.path.basename(path), text)
 
     def _show_log_viewer(self, title, text):

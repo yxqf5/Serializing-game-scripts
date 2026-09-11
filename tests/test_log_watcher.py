@@ -2,7 +2,9 @@
 import os
 import sys
 import tempfile
+import time
 import unittest
+import unittest.mock
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BASE not in sys.path:
@@ -273,6 +275,101 @@ class TestResolveTaskStatus(unittest.TestCase):
         self.assertEqual(
             lw.resolve_task_status([], [], done_configured=True, pending_configured=False),
             lw.TASK_INCOMPLETE)
+
+
+class TestFollowGuardAndReadCap(unittest.TestCase):
+    """轮转跟随守卫（防旧文件被触碰后整份误读）与单次读取上限。"""
+
+    def test_should_follow_rejects_old_file_when_current_alive(self):
+        """候选文件创建时间早于本次运行开始：不跟随（防外部触碰旧文件）。"""
+        with tempfile.TemporaryDirectory() as d:
+            cur = os.path.join(d, "cur.log")
+            old = os.path.join(d, "old.log")
+            _write_gbk(cur, "x")
+            _write_gbk(old, "y")
+            w = lw.ScriptLogWatcher(log_file=os.path.join(d, "*.log"))
+            w.path = cur
+            w._started_at = time.time()
+            with unittest.mock.patch("os.path.getctime", return_value=w._started_at - 100):
+                self.assertFalse(w._should_follow(old))
+            # 候选是本次运行期间创建的（ctime 晚于 start）→ 跟随
+            self.assertTrue(w._should_follow(old))
+            # 当前文件已不存在 → 必须跟随，否则监控中断
+            os.remove(cur)
+            with unittest.mock.patch("os.path.getctime", return_value=w._started_at - 100):
+                self.assertTrue(w._should_follow(old))
+
+    def test_poll_keeps_following_current_when_only_old_file_touched(self):
+        """运行中旧文件被触碰成为 mtime 最新：不切过去，继续读当前文件。"""
+        with tempfile.TemporaryDirectory() as d:
+            cur = os.path.join(d, "cur.log")
+            old = os.path.join(d, "old.log")
+            _write_gbk(cur, "")
+            _write_gbk(old, "旧任务已完成\n")
+            os.utime(old, (1, 1))
+            w = lw.ScriptLogWatcher(log_file=os.path.join(d, "*.log"), encoding="gbk",
+                                    daily_done_patterns=["任务已完成"])
+            w.start()
+            self.assertTrue(w.path.endswith("old.log") or w.path.endswith("cur.log"))
+            w.path = cur          # 模拟已锁定当前文件
+            w._offset = 0
+            _append_gbk(cur, "新任务已完成\n")
+            os.utime(old, (time.time() + 10,) * 2)  # 旧文件 mtime 被外部刷新到最新
+            real_ctime = os.path.getctime
+            with unittest.mock.patch(
+                    "os.path.getctime",
+                    side_effect=lambda p: w._started_at - 100 if p == old else real_ctime(p)):
+                w.poll()
+            result = w.finish()
+            # 未切到 old.log：旧日志里的「旧任务已完成」没有混进来
+            self.assertEqual(len(result["daily_done"]), 1)
+            self.assertIn("新任务已完成", result["daily_done"][0])
+            self.assertTrue(all("旧任务" not in line for line in result["daily_done"]))
+
+    def test_poll_follows_genuinely_new_file(self):
+        """脚本运行期间创建的新日志文件正常跟随（守卫不误伤）。"""
+        with tempfile.TemporaryDirectory() as d:
+            stale = os.path.join(d, "2026-09-10-1.log")
+            fresh = os.path.join(d, "2026-09-11-1.log")
+            _write_gbk(stale, "旧会话内容\n")
+            os.utime(stale, (1, 1))
+            w = lw.ScriptLogWatcher(log_file=os.path.join(d, "*.log"), encoding="gbk",
+                                    daily_done_patterns=["收尾任务已提交"])
+            w.start()
+            self.assertTrue(w.path.endswith("2026-09-10-1.log"))
+            _write_gbk(fresh, "收尾任务已提交\n")
+            w.poll()
+            result = w.finish()
+            self.assertEqual(len(result["daily_done"]), 1)
+            self.assertTrue(w.path.endswith("2026-09-11-1.log"))
+
+    def test_poll_read_capped_and_catches_up(self):
+        """单次 poll 读入量受上限约束，后续 poll 分批消化不丢行。"""
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "big.log")
+            _write_gbk(p, "")
+            w = lw.ScriptLogWatcher(log_file=p, encoding="gbk",
+                                    daily_done_patterns=["任务已完成"])
+            w.start()
+            payload = "前缀内容" * 20 + "任务已完成\n"
+            _append_gbk(p, payload)
+            size = os.path.getsize(p)
+            with unittest.mock.patch.object(lw, "MAX_POLL_READ", 8):
+                w.poll()
+                self.assertLess(w._offset, size)   # 首次只读入上限字节
+                while w._offset < size:             # 分批追上剩余增量
+                    w.poll()
+            result = w.finish()
+            self.assertEqual(len(result["daily_done"]), 1)
+            self.assertEqual(w._offset, size)
+
+    def test_decode_lossy_prefers_configured_encoding(self):
+        """残留字节按配置编码容错解码，不再硬编码 utf-8。"""
+        gbk_bytes = "完成".encode("gbk")
+        self.assertEqual(lw._decode_lossy(gbk_bytes, ["gbk"]), "完成")
+        self.assertIn("\ufffd", lw._decode_lossy(gbk_bytes[:1], ["gbk"]))
+        utf8_bytes = "完成".encode("utf-8")
+        self.assertEqual(lw._decode_lossy(utf8_bytes, ["utf-8", "gbk"]), "完成")
 
 
 if __name__ == "__main__":

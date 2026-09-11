@@ -21,6 +21,7 @@
 import os
 import glob
 import re
+import time
 
 try:
     import ctypes
@@ -31,6 +32,10 @@ DEFAULT_ENCODINGS = ["utf-8", "gbk"]
 
 # 多字节编码一个字符最多占 3 个字节（utf-8 三字节序列 / gbk 双字节）
 MAX_INCOMPLETE_TAIL = 3
+
+# 单次 poll 最多读入的字节数：脚本异常时一次性倾泻超大日志也不会内存爆涨，
+# 剩余增量由后续 poll 分批消化
+MAX_POLL_READ = 8 * 1024 * 1024
 
 # 预设任务完成状态（runner_core 据此输出「已完成 / 未完成」）
 TASK_COMPLETED = "completed"
@@ -118,6 +123,16 @@ def _try_decode(data, encodings):
         except (UnicodeDecodeError, LookupError):
             continue
     return None, None
+
+
+def _decode_lossy(data, encodings):
+    """按候选编码顺序容错解码（用于流末尾的残留字节）；绝不抛异常。"""
+    for enc in encodings:
+        try:
+            return data.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return data.decode("utf-8", errors="replace")
 
 
 def resolve_log_file(pattern):
@@ -222,6 +237,8 @@ class ScriptLogWatcher:
         self._pending = b""
         self._partial = ""
         self._identity = None
+        # 本次运行开始的墙钟时刻：轮转跟随只认这之后创建的文件
+        self._started_at = time.time()
         if self.path:
             try:
                 self._offset = os.path.getsize(self.path)
@@ -230,6 +247,21 @@ class ScriptLogWatcher:
             self._identity = _file_identity(self.path)
         return self.path is not None
 
+    def _should_follow(self, path):
+        """是否跟随切换到候选日志文件：只认本次运行期间创建的文件。
+
+        轮转探测按 mtime 取最新，旧文件若被外部触碰（其他实例、编辑器、
+        同步盘）会被误选；从头读会把整份旧日志当成本次新增行，造成关键词
+        误判。当前文件已不存在（被删除/改名）时必须跟随，否则监控中断。
+        """
+        if self.path is None or not os.path.exists(self.path):
+            return True
+        try:
+            ctime = os.path.getctime(path)
+        except OSError:
+            return True
+        return ctime >= self._started_at - 2.0
+
     def poll(self):
         """增量读取新增行；自动识别日志轮转（文件被替换/清空时从头读）。"""
         if not self.path:
@@ -237,6 +269,8 @@ class ScriptLogWatcher:
         path = resolve_log_file(self.pattern)
         if not path:
             return
+        if path != self.path and not self._should_follow(path):
+            path = self.path
         try:
             size = os.path.getsize(path)
         except OSError:
@@ -256,10 +290,10 @@ class ScriptLogWatcher:
         try:
             with open(path, "rb") as f:
                 f.seek(self._offset)
-                data = f.read()
+                data = f.read(MAX_POLL_READ)
         except OSError:
             return
-        self._offset = size
+        self._offset += len(data)
         if self._pending:
             data = self._pending + data
         text, self._pending = _decode_incremental(data, self._encodings())
@@ -294,7 +328,7 @@ class ScriptLogWatcher:
         tail = self._partial
         self._partial = ""
         if self._pending:
-            tail += self._pending.decode("utf-8", errors="replace")
+            tail += _decode_lossy(self._pending, self._encodings())
             self._pending = b""
         if tail:
             self._classify_line(tail)
