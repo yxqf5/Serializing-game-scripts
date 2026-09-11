@@ -269,7 +269,76 @@ def _setup_bettergi(plugin, dry_run):
 
 
 def _setup_maa(plugin, dry_run):
-    """明日方舟 MAA：gui.json 设自动开始 / 自动开模拟器 / 完成后退出模拟器+退出MAA。"""
+    """明日方舟 MAA：自动开始 / 自动开模拟器 / 完成后退出模拟器+退出MAA。
+
+    MAA v6 起配置迁移到 gui.new.json（Gui/StartUpSettings 等嵌套结构），
+    旧版仍用 gui.json 的点号键扁平结构。两个格式都支持，新文件优先。
+    """
+    d = _assistant_dir(plugin)
+    new_cfg = os.path.join(d, "config", "gui.new.json")
+    if os.path.isfile(new_cfg):
+        r = _maa_setup_new(new_cfg, dry_run)
+        if r is not None:
+            return r
+    return _maa_setup_old(plugin, dry_run)
+
+
+def _maa_setup_new(path, dry_run):
+    """MAA v6+ 新格式 gui.new.json；解析不出有效结构时返回 None 走旧格式回退。"""
+    try:
+        data = _load_json(path)
+    except Exception:
+        return None
+    confs = data.get("Configurations") if isinstance(data, dict) else None
+    if not isinstance(confs, dict) or not confs:
+        return None
+    cur = data.get("Current") or next(iter(confs))
+    conf = confs.get(cur)
+    if not isinstance(conf, dict):
+        return None
+    gui = conf.setdefault("Gui", {})
+    if not isinstance(gui, dict):
+        return None
+    startup = gui.setdefault("StartUpSettings", {})
+    if not isinstance(startup, dict):
+        return None
+    changed = []
+    for key, val in (("RunDirectly", True),        # 启动 MAA 后自动开始任务
+                     ("StartEmulator", True)):     # 启动 MAA 时自动开启模拟器
+        if startup.get(key) != val:
+            changed.append(key)
+            if not dry_run:
+                startup[key] = val
+    actions = str(gui.get("PostActions", "") or "")
+    if not ("ExitEmulator" in actions and "ExitSelf" in actions):
+        changed.append("PostActions")
+        if not dry_run:
+            gui["PostActions"] = "ExitEmulator, ExitSelf"
+    if changed and not dry_run:
+        backup_files("maa_gui", [path])
+        try:
+            _dump_json(path, data)
+        except Exception:
+            return _manual_result(["gui.new.json 写入失败（可能被占用），请关闭 MAA 后重试。"])
+    connect = gui.get("ConnectSettings") or {}
+    adb = str(connect.get("AdbPath", "") or "")
+    adb_ok = bool(adb) and os.path.isfile(adb)
+    checks = [
+        _key_check("启动 MAA 后自动开始任务", "RunDirectly", changed, dry_run),
+        _key_check("启动 MAA 时自动开启模拟器", "StartEmulator", changed, dry_run),
+        _key_check("完成后退出模拟器并退出 MAA", "PostActions", changed, dry_run),
+        _check("已配置模拟器连接（ADB 路径）", adb_ok,
+               "打开 MAA → 设置 → 连接设置，选择 ADB 路径与地址（MuMu 一般可自动检测）。"),
+    ]
+    manual = [] if adb_ok else [
+        "MAA 需要配合安卓模拟器（推荐 MuMu）：先安装 MuMu 模拟器并登录明日方舟，"
+        "再打开 MAA → 设置 → 连接设置 选择 ADB 路径与地址。",
+    ]
+    return _result(applied=changed, manual=manual, checks=checks)
+
+
+def _maa_setup_old(plugin, dry_run):
+    """MAA 旧版格式 gui.json（点号键扁平结构）。"""
     d = _assistant_dir(plugin)
     cfg = os.path.join(d, "config", "gui.json")
     if not os.path.isfile(cfg):

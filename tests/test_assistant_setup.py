@@ -154,6 +154,78 @@ class TestMaa(AssistantSetupTestBase):
         self.assertTrue(adb and not adb[0]["ok"])
 
 
+class TestMaaNewFormat(AssistantSetupTestBase):
+    """MAA v6+ 的 gui.new.json 嵌套新格式。"""
+
+    def _fixture(self, run_directly=False, start_emu=False, actions="", adb=None):
+        base = os.path.join(self.tmp, "MAA")
+        adb_path = ""
+        if adb is None:
+            adb_path = os.path.join(base, "adb.exe")
+            _write(adb_path, "")
+            adb = adb_path
+        cfg = os.path.join(base, "config", "gui.new.json")
+        _write(cfg, json.dumps({
+            "Current": "Default",
+            "ConfigVersion": 1,
+            "Configurations": {"Default": {"Gui": {
+                "StartUpSettings": {"RunDirectly": run_directly, "StartEmulator": start_emu},
+                "PostActions": actions,
+                "ConnectSettings": {"AdbPath": adb},
+            }}},
+        }, ensure_ascii=False))
+        return self._plugin(os.path.join("MAA", "MAA.exe"), "maa_gui"), cfg
+
+    def test_apply_writes_new_format(self):
+        plugin, cfg = self._fixture()
+        r = asetup.apply_for_plugin(plugin)
+        self.assertEqual(r["applied"], ["RunDirectly", "StartEmulator", "PostActions"])
+        gui = json.loads(_read(cfg))["Configurations"]["Default"]["Gui"]
+        self.assertIs(gui["StartUpSettings"]["RunDirectly"], True)
+        self.assertIs(gui["StartUpSettings"]["StartEmulator"], True)
+        self.assertEqual(gui["PostActions"], "ExitEmulator, ExitSelf")
+
+    def test_already_configured_no_change(self):
+        plugin, _ = self._fixture(True, True, "ExitEmulator, ExitSelf")
+        r = asetup.apply_for_plugin(plugin)
+        self.assertEqual(r["applied"], [])
+        self.assertTrue(all(c["ok"] for c in r["checks"]))
+
+    def test_verify_dry_run_no_write(self):
+        plugin, cfg = self._fixture()
+        before = _read(cfg)
+        checks = asetup.verify_for_plugin(plugin)
+        self.assertFalse(all(c["ok"] for c in checks))
+        self.assertEqual(_read(cfg), before)
+
+    def test_new_file_takes_precedence_over_old(self):
+        plugin, _ = self._fixture(True, True, "ExitEmulator, ExitSelf")
+        old = os.path.join(self.tmp, "MAA", "config", "gui.json")
+        old_text = json.dumps({"Current": "Default", "Configurations": {"Default": {}}})
+        _write(old, old_text)
+        self.assertTrue(all(c["ok"] for c in asetup.verify_for_plugin(plugin)))
+        self.assertEqual(_read(old), old_text)
+
+    def test_corrupt_new_file_falls_back_to_old(self):
+        plugin, _ = self._fixture()
+        old = os.path.join(self.tmp, "MAA", "config", "gui.json")
+        _write(old, json.dumps({
+            "Current": "Default",
+            "Configurations": {"Default": {"Start.RunDirectly": "False"}},
+        }))
+        _write(os.path.join(self.tmp, "MAA", "config", "gui.new.json"), "{broken")
+        r = asetup.apply_for_plugin(plugin)
+        self.assertEqual(sorted(r["applied"]),
+                         ["MainFunction.PostActions", "Start.OpenEmulatorAfterLaunch",
+                          "Start.RunDirectly"])
+
+    def test_adb_missing_warns(self):
+        plugin, _ = self._fixture(adb="")
+        r = asetup.apply_for_plugin(plugin)
+        adb = [c for c in r["checks"] if "ADB" in c["name"]]
+        self.assertTrue(adb and not adb[0]["ok"])
+
+
 class TestMaaEnd(AssistantSetupTestBase):
     TASK = {"id": "abc1234", "taskName": "DailyRewards", "enabled": True,
             "enabledByController": {"Win32-Front": True}, "optionValues": {}}

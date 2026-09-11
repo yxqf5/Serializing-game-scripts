@@ -5,6 +5,31 @@
 
 ---
 
+## 2026-09-12 · 窗口缩放卡顿根治：日志字体回退链 + 界面日志截断 + 画布同步节流
+
+背景：用户反馈拉伸窗口时 UI 明显卡顿。经端到端基准（加载真实程序模拟逐像素缩放、cProfile、组件二分、同轮交错对照）定位，**不是**此前怀疑的 Text 全量重折行（行数 600 与 1 万同耗），而是三个因素叠加。
+
+### 根因（按贡献排序）
+
+1. **日志 Text 用 Consolas 字体（无中文字形）**：每个中文字符走 GDI font-linking 回退链测量/渲染，实测同样 1 万行中文日志，Consolas 体系 ~450ms/步 vs 原生中文字体 ~110ms/步（150% DPI）。只要日志区有中文内容就有此项开销，与行数基本无关。
+2. **高 DPI（tk scaling=2.0）下 CJK 文本渲染偏慢**：卡片、状态条等全部控件的逐帧重排是固定大项，无法从回调层优化。
+3. **主页/编辑页/首次运行页的 Canvas 内嵌宽度逐像素同步**：每个 Configure 事件 `itemconfig` 强制全部卡片/表单控件重排（实测 ~50ms/步）。
+
+### 修复（游戏助手.pyw）
+
+- **日志 Text 字体 Consolas → `_FAMILY`（原生中文字体）**，同类的粘贴填充编辑器、导入日志查看窗口一并修改（`_show_log_viewer`）。注释注明原因防回归。**这是主要收益**
+- 新增 `LOG_VIEW_LINES=600`：界面 Text 只保留最近 600 行（`_render_log_store` 只插尾部、`_insert_log_batch` 插入后裁头），完整 1 万行仍在 LogStore，导出/复制/自动保存（5 万行 `_run_log_buffer`）不受影响。**注意：裁剪必须在 `state="normal"` 下做，disabled 的 `delete()` 静默无效**（调试时踩过）
+- 新增 `_throttle(attr, ms, func)` 通用节流（至多每 80ms 执行一次、停止后补一次）：主页 `_on_list_canvas_configure` 合并为 `_apply_card_layout`（内嵌宽度 + 卡片省略号一次做）；编辑页/首次运行页内嵌宽度同步走 `_sync_canvas_inner`。拖拽中内容仍以 ~12 次/秒跟随
+- 移除 `_sync_card_wraplength` 的 after_idle 自调度（`_wrap_sync_job`），统一走 `_throttle`
+
+### 验证
+
+- 同步基准（每步 geometry+update，40 步×2 轮，同轮交错）：等效改前 ~451-509ms/步 → 修复后 ~293-303ms/步（**1.55-1.65x**）；真实拖拽为 60-120Hz 事件流，节流将卡片重排从每秒 60-120 次压到至多 12 次，实际体感增益更大
+- 界面日志自检：LogStore=10000 行时界面 Text 恰为 600 行、跟随底部正常
+- `python -m py_compile` 通过；`run_tests.py` 144 项全过
+
+---
+
 ## 2026-09-12 · 日志模块加固：保存缓冲 / 轮转守卫 / 读取上限 / 尾部解码
 
 背景：日志模块全面审查（log_watcher / log_saver / runner_core 日志链路 / 界面日志区）后修复 4 个问题。核心链路（线程队列、增量读取、编码兜底、原子落盘、并行线程安全）审查确认健壮，本次均为防御性加固。
@@ -106,6 +131,7 @@
 
 - `load_plugins` 一次性迁移：`preset_id == "maa_gui"` 且无 `parallel` 字段的老插件自动补 `parallel: true` 写回（幂等）
 - 编辑页：显示名称下方新增复选框「⇉ 并行运行（与其它任务同时启动）」+ 灰字说明；`_save_edit` 存 `p["parallel"]`
+- **主页卡片「⇉」快捷开关**：每行右侧 ▲▼ 前新增「⇉」按钮，点一下直接切换该任务的并行并保存（`toggle_parallel` 仿照 `toggle` 就地刷新按钮配色与状态行，不重建列表；运行期间随其它控件一起禁用）；状态行文字抽成 `_card_status` 供卡片与开关复用
 - 主页卡片状态行追加「· ⇉ 并行」标记
 - `_apply_run_event`：并行 task_started／task_finished 维护 `run_state["parallel_names"]`（不推进进度条），并行结果同样写入 `_run_tasks`（md 日志摘要）；`queue_finished` 时进度条走满
 - `_update_global_run_bar`：运行中 detail 追加「· ⇉ 并行：任务名」；文案「串行任务未运行」等微调为「任务未运行」

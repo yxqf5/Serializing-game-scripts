@@ -217,7 +217,6 @@ class App(tk.Tk):
         self.nav_items = {}
         self._cards = []
         self._drag_from = None
-        self._drag_target = None
         self._tooltip_win = None
         self._tooltip_job = None
         self._run_started_at = None   # 本轮运行开始时间（自动保存日志用）
@@ -796,6 +795,16 @@ class App(tk.Tk):
             self.canvas.itemconfig("inner", width=cw)
         self._do_sync_card_wraplength()
 
+    def _sync_card_wraplength(self):
+        self._throttle("_card_layout", 80, self._apply_card_layout)
+
+    def _sync_canvas_inner(self, cv, tag):
+        """把 Canvas 内嵌容器宽度对齐到画布宽度（经 _throttle 调用，避免逐像素重排）。"""
+        if not cv.winfo_exists():
+            return
+        cv.itemconfig(tag, width=cv.winfo_width())
+        cv.configure(scrollregion=cv.bbox("all"))
+
     def _do_sync_card_wraplength(self):
         if not hasattr(self, "canvas") or not self.canvas.winfo_exists():
             return
@@ -944,7 +953,7 @@ class App(tk.Tk):
         handle = tk.Label(inner, text="≡", bg=panel, fg=t["sub"], font=F(15),
                           width=2, cursor="fleur")
         handle.grid(row=0, column=0, rowspan=3, padx=(0, 4), sticky="ns")
-        handle.bind("<ButtonPress-1>", lambda e, i=idx: self._start_card_drag(i))
+        handle.bind("<ButtonPress-1>", self._start_card_drag)
         handle.bind("<B1-Motion>", self._move_card_drag)
         handle.bind("<ButtonRelease-1>", self._finish_card_drag)
 
@@ -980,8 +989,18 @@ class App(tk.Tk):
 
         right = tk.Frame(inner, bg=panel)
         right.grid(row=0, column=3, rowspan=3, sticky="e")
-        up = self._icon_btn(right, "▲", lambda: self.move(idx, -1)); up.pack(side="left", padx=2)
-        down = self._icon_btn(right, "▼", lambda: self.move(idx, +1)); down.pack(side="left", padx=2)
+        par_on = bool(p.get("parallel"))
+        par = self._button(right, "⇉", lambda pl=p: self.toggle_parallel(pl),
+                           primary=par_on, compact=True, width=2)
+        if not par_on:
+            par.config(bg=t["panel"], fg=t["sub"])
+            par._base = t["panel"]
+        self._attach_tooltip(par, "并行开关：开启后点「开始运行」时该任务立即与其它任务同时跑。\n"
+                                  "适合 MAA 等模拟器／后台脚本；会抢真实鼠标的脚本（原神、绝区零等）别开。")
+        par.pack(side="left", padx=2)
+        # 用插件对象在点击时定位下标：卡片顺序会随拖拽变化，建卡时的下标会失准。
+        up = self._icon_btn(right, "▲", lambda pl=p: self.move_plugin(pl, -1)); up.pack(side="left", padx=2)
+        down = self._icon_btn(right, "▼", lambda pl=p: self.move_plugin(pl, +1)); down.pack(side="left", padx=2)
         edit = self._button(right, "编辑", lambda: self.open_edit(p), compact=True)
         edit.pack(side="left", padx=(8, 2))
         delete = self._icon_btn(right, "×", lambda: self.delete_plugin(p)); delete.pack(side="left", padx=2)
@@ -989,53 +1008,98 @@ class App(tk.Tk):
         self._cards.append({
             "plugin": p, "strip": strip, "switch": sw, "name": name_lbl,
             "index": idx, "full_name": full_name,
-            "path": path_lbl, "full_path": launcher,
-            "card": card, "handle": handle, "controls": [sw, up, down, edit, delete],
+            "path": path_lbl, "full_path": launcher, "status": st_lbl,
+            "parallel_btn": par,
+            "card": card, "handle": handle, "controls": [sw, par, up, down, edit, delete],
         })
         self.after_idle(self._sync_card_wraplength)
         self._refresh_card_controls()
-
-    def _start_card_drag(self, idx):
+    def _start_card_drag(self, event):
         if self.running or self._preflight_busy:
             return
+        idx = self._card_index_by_handle(event.widget)
+        if idx < 0:
+            return
         self._drag_from = idx
-        self._drag_target = idx
+        self._cards[idx]["card"].config(highlightbackground=self.t["accent"])
+
+    def _card_index_by_handle(self, handle):
+        for i, refs in enumerate(self._cards):
+            if refs.get("handle") is handle:
+                return i
+        return -1
 
     def _move_card_drag(self, event):
-        if self._drag_from is None:
+        if self._drag_from is None or not self._cards:
+            return
+        if not (0 <= self._drag_from < len(self._cards)):
+            self._drag_from = None
             return
         y = event.y_root
-        target = self._drag_from
+        dragged = self._cards[self._drag_from]["card"]
+        first, last = self._cards[0]["card"], self._cards[-1]["card"]
+        if y < first.winfo_rooty():                         # 拖到列表上方 → 置顶
+            self._drag_card_to(self._drag_from, 0)
+            return
+        if y >= last.winfo_rooty() + last.winfo_height():   # 拖到列表下方 → 沉底
+            if self._drag_from != len(self._cards) - 1:
+                self._drag_card_to(self._drag_from, len(self._cards) - 1)
+            return
         for i, refs in enumerate(self._cards):
             card = refs["card"]
-            if card.winfo_rooty() <= y <= card.winfo_rooty() + card.winfo_height():
-                target = i
-                break
-        if target == self._drag_target:
+            top, height = card.winfo_rooty(), card.winfo_height()
+            if top - 3 <= y < top + height + 3:
+                if card is dragged:
+                    return
+                # 上半 → 插到它前面，下半 → 插到它后面。换位后光标必然落在
+                # 被拖卡片自己身上，天然不会来回抖动。
+                self._drag_card_to(self._drag_from, i if y < top + height / 2 else i + 1)
+                return
+
+    def _drag_card_to(self, from_idx, to_idx):
+        """拖拽中把卡片挪到新位置：只 pack 移动这一张卡，其余卡片原地不动，
+        不销毁不重建，因此全程无闪烁。"""
+        if not (0 <= from_idx < len(self._cards)):
             return
-        # 只更新高亮变化的两张卡，避免拖动时每像素全量重绘。
-        prev = self._drag_target
-        self._drag_target = target
-        if prev is not None and 0 <= prev < len(self._cards):
-            self._cards[prev]["card"].config(highlightbackground=self.t["line"])
-        if 0 <= target < len(self._cards):
-            self._cards[target]["card"].config(highlightbackground=self.t["accent"])
+        to_idx = max(0, min(to_idx, len(self._cards) - 1))
+        if to_idx == from_idx:
+            return
+        item = self.plugins.pop(from_idx)
+        self.plugins.insert(to_idx, item)
+        refs = self._cards.pop(from_idx)
+        self._cards.insert(to_idx, refs)
+        card = refs["card"]
+        pack_opts = {"fill": "x", "pady": 3, "padx": 4}
+        if to_idx + 1 < len(self._cards):
+            card.pack(before=self._cards[to_idx + 1]["card"], **pack_opts)
+        else:
+            card.pack(**pack_opts)
+        self._drag_from = to_idx
+        self.update_idletasks()   # 立即重算几何，下一次命中测试的坐标才准确
+        self._renumber_cards()
 
     def _finish_card_drag(self, event=None):
-        source, target = self._drag_from, self._drag_target
-        self._drag_from = None
-        self._drag_target = None
-        for refs in self._cards:
-            refs["card"].config(highlightbackground=self.t["line"])
-        if source is None or target is None or source == target:
+        if self._drag_from is None:
             return
-        item = self.plugins.pop(source)
-        self.plugins.insert(target, item)
+        self._drag_from = None
+        for refs in self._cards:
+            if refs["card"].winfo_exists():
+                refs["card"].config(highlightbackground=self.t["line"])
+        self._save_orders()
+
+    def _save_orders(self):
+        """把当前列表顺序写回 order 字段，只保存真正变化的任务。"""
         for order, plugin in enumerate(self.plugins, 1):
             if plugin.get("order") != order:
                 plugin["order"] = order
                 save_plugin(plugin)
-        self._render_cards()
+
+    def _renumber_cards(self):
+        """换位后就地刷新卡片上的序号（01、02…），不重建卡片。"""
+        for pos, refs in enumerate(self._cards):
+            refs["index"] = pos
+        self._last_wrap_w = -10 ** 9
+        self._do_sync_card_wraplength()
 
     def _attach_tooltip(self, widget, text):
         widget.bind("<Enter>", lambda e, w=widget, s=text: self._schedule_tooltip(w, s), add="+")
@@ -1095,7 +1159,8 @@ class App(tk.Tk):
         form = tk.Frame(cv, bg=t["bg"])
         cv.create_window((0, 0), window=form, anchor="nw", tags="f")
         form.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
-        cv.bind("<Configure>", lambda e: cv.itemconfig("f", width=e.width))
+        cv.bind("<Configure>", lambda e: self._throttle(
+            "_cvw_f", 80, lambda: self._sync_canvas_inner(cv, "f")))
         self._bind_wheel(cv)
 
         def label(text, hint="", parent=None):
@@ -1379,7 +1444,7 @@ class App(tk.Tk):
         box.rowconfigure(0, weight=1)
         box.columnconfigure(0, weight=1)
         text = tk.Text(box, bg=t["panel"], fg=t["fg"], insertbackground=t["fg"],
-                       font=("Consolas", 10), relief="flat", wrap="word",
+                       font=(_FAMILY, 10), relief="flat", wrap="word",
                        highlightthickness=1, highlightbackground=t["line"])
         vsb = ttk.Scrollbar(box, orient="vertical", command=text.yview, style="Vert.TScrollbar")
         text.configure(yscrollcommand=vsb.set)
@@ -1776,17 +1841,52 @@ class App(tk.Tk):
                 break
         self._refresh_home_status()
 
+    def toggle_parallel(self, p):
+        """主页卡片「⇉」快捷开关：就地切换并行状态并保存。"""
+        if self.running or self._preflight_busy:
+            return
+        p["parallel"] = not bool(p.get("parallel", False))
+        save_plugin(p)
+        t = self.t
+        for refs in self._cards:
+            if refs["plugin"] is p:
+                on = bool(p.get("parallel"))
+                btn = refs.get("parallel_btn")
+                if btn and btn.winfo_exists():
+                    btn.config(bg=(t["accent"] if on else t["panel"]),
+                               fg=(t["on_accent"] if on else t["sub"]))
+                    btn._base = t["accent"] if on else t["panel"]
+                st = refs.get("status")
+                if st and st.winfo_exists():
+                    text, color = self._card_status(p)
+                    st.config(text=text, fg=color)
+                break
+        self._refresh_home_status()
+
+    def move_plugin(self, p, delta):
+        """▲▼ 移动：按插件对象定位当前下标（卡片顺序会随拖拽变化，
+        不能用建卡时捕获的下标）。"""
+        if self.running or self._preflight_busy:
+            return
+        for i, q in enumerate(self.plugins):
+            if q is p:
+                self.move(i, delta)
+                return
+
     def move(self, idx, delta):
         if self.running or self._preflight_busy:
             return
         j = idx + delta
-        if j < 0 or j >= len(self.plugins):
+        if j < 0 or j >= len(self.plugins) or idx == j or idx >= len(self._cards):
             return
-        a, b = self.plugins[idx], self.plugins[j]
-        a["order"], b["order"] = b["order"], a["order"]
-        save_plugin(a); save_plugin(b)
-        self.reload()
-        self._render_cards()
+        # 就地交换相邻两张卡片，不整列重建、不重读磁盘，避免每次点击都闪烁。
+        self.plugins[idx], self.plugins[j] = self.plugins[j], self.plugins[idx]
+        self._cards[idx], self._cards[j] = self._cards[j], self._cards[idx]
+        top = self._cards[min(idx, j)]["card"]
+        bottom = self._cards[max(idx, j)]["card"]
+        top.pack(before=bottom, fill="x", pady=3, padx=4)
+        self._renumber_cards()
+        self._save_orders()
 
     def delete_plugin(self, p):
         if self.running or self._preflight_busy:
@@ -2236,7 +2336,8 @@ class App(tk.Tk):
         inner_wrap = tk.Frame(cv, bg=t["bg"])
         cv.create_window((0, 0), window=inner_wrap, anchor="nw", tags="fr_inner")
         inner_wrap.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
-        cv.bind("<Configure>", lambda e: cv.itemconfig("fr_inner", width=e.width))
+        cv.bind("<Configure>", lambda e: self._throttle(
+            "_cvw_fr_inner", 80, lambda: self._sync_canvas_inner(cv, "fr_inner")))
         self._bind_wheel(cv)
 
         # 就绪进度总览
@@ -3091,7 +3192,7 @@ class App(tk.Tk):
         body = tk.Frame(win, bg=t["log_bg"], highlightthickness=1, highlightbackground=t["line"])
         body.pack(fill="both", expand=True, padx=14, pady=(0, 14))
         txt = tk.Text(body, bg=t["log_bg"], fg=t["log_fg"], insertbackground=t["fg"],
-                      font=("Consolas", 11), relief="flat", padx=12, pady=10,
+                      font=(_FAMILY, 11), relief="flat", padx=12, pady=10,
                       highlightthickness=0, wrap="none")
         sb = ttk.Scrollbar(body, orient="vertical", command=txt.yview, style="Vert.TScrollbar")
         txt.configure(yscrollcommand=sb.set)

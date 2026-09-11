@@ -117,7 +117,7 @@ AI_HANDOFF.md         本文件
 
 ### 3.5 并行运行(parallel 字段)
 
-每个插件可勾选 `parallel: true`(编辑页「⇉ 并行运行」复选框),语义:
+每个插件可勾选 `parallel: true`,入口有两处:主页卡片右侧「⇉」快捷按钮(亮色=已并行,`toggle_parallel` 就地刷新不重建列表)和编辑页「⇉ 并行运行」复选框,写的是同一个字段。语义:
 
 - **启动**:点「开始运行」后,全部并行任务立即用独立线程同时启动(组内按卡片顺序、间隔 `PARALLEL_STAGGER_SEC=3` 秒错峰);串行任务照旧依次跑,两组互不等待。
 - **结束**:串行队列跑完后 `join` 等全部并行任务收尾,才输出每日汇总;中途点「停止」则两组一起中止。
@@ -149,7 +149,7 @@ UI 层新版(2026-07):**添加页深度探测调用 `resolve_all_candidates`**,�
 |---|---|---|
 | `m7a_main` | `<助手目录>\config.yaml` | `after_finish: Exit`、`pause_after_success: false`(顶层键行级替换,保留行内注释,UTF-8/GBK 自适应) |
 | `bettergi_onedragon` | `User\OneDragon\*.json`(取最新) | `CompletionAction = "关闭游戏和软件"` |
-| `maa_gui` | `config\gui.json` | `Configurations.Default` 下 `Start.RunDirectly="True"`、`Start.OpenEmulatorAfterLaunch="True"`、`MainFunction.PostActions="12"`(退出模拟器+退出MAA;键名来自本机 gui.json.old 全量历史验证) |
+| `maa_gui` | **双格式**：v6+ 用 `config\gui.new.json`（嵌套 `Gui.StartUpSettings.RunDirectly/StartEmulator=true`（布尔）、`Gui.PostActions` 含 `ExitEmulator, ExitSelf`、连接信息在 `Gui.ConnectSettings.AdbPath`）；旧版用 `config\gui.json` 点号键（`Start.RunDirectly="True"` 等，值为字符串）。新文件存在且可解析时优先走新格式，解析失败回退旧格式。注意 MAA 会**原地自更新**（目录名仍叫 MAA-v5.16.8 但 exe 可能已是 v6.17.5），格式以 `gui.new.json` 是否存在为准 |
 | `maaend_gui` | `config\mxu-MaaEnd.json` | 任务队列末尾补两个 `__MXU_KILLPROC__` 任务(杀 Endfield.exe + SELF 退出自身);实例按 `savedDevice.connectedProgramPath` 含 Endfield.exe 选取 |
 | `onedragon` | `config\one_dragon.yml` | 顶层键 `after_done: 关闭游戏` |
 
