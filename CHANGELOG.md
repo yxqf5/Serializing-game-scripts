@@ -5,6 +5,105 @@
 
 ---
 
+## 2026-09-12 · Qt 版完整入库:旧版 UI 的最后版本(标签 v1.2.0-qt-oldui)
+
+背景:Qt 版此前一直在工作区未入库。在启动主页/设置页 UI 重设计之前,把当前旧版 UI 的完整 Qt 实现提交并打标签,作为重设计前的基线;此标签之后的改动即新 UI 迭代。
+
+### 入库内容
+
+- `ui_qt/` 页面包全部入库(app/home/settings/add/edit/wizard/help/log_panel/run_controller/theme/core_glue/dialogs)
+- `schedule_core.py`(每日定时,Qt 版专用)+ `display_ctrl.py`(运行时分辨率切换)+ 对应三份新测试
+- `游戏助手Qt.pyw` 入口、`一键长草助手Qt.spec` 打包规格、`build_exe_qt.bat` 打包脚本
+- `.gitignore` 补 `一键长草助手Qt.exe`(与 tkinter 版 exe 同例,打包产物不入库)
+- AI_HANDOFF / 使用说明 / CHANGELOG 同步(含ffi.dll 打包修复、分辨率切换两节)
+
+### 验证
+
+- `run_tests.py` 184 项全过
+
+---
+
+## 2026-09-12 · 修复打包 exe 启动崩溃:conda 打包缺 ffi.dll 导致 _ctypes 加载失败
+
+背景:exe 启动即崩「ImportError: DLL load failed while importing _ctypes: 找不到指定的模块」。根因:miniconda 的 `_ctypes.pyd` 动态链接 `%PREFIX%\Library\bin\ffi.dll`,PyInstaller 分析不到这层依赖、没打进包。此前一直未暴露,是因为 runner_core 等处的 `import ctypes` 全部 try/except 静默降级(exe 里管理员检测/快速进程快照其实一直在走降级路径);display_ctrl.py 新增后顶层硬 `import ctypes`,才把整个启动炸了。旧 tkinter 版 spec 早已手动收过 `ffi.dll`(conda_dlls 列表里就有),Qt 版 spec 漏了同样的处理。
+
+### 修复
+
+- `一键长草助手Qt.spec`:glob `sys.prefix\Library\bin\ffi*.dll` 显式加入 binaries;换非 conda 环境打包时 glob 为空、无副作用
+- `display_ctrl.py` 加固:`import ctypes` 改 try/except 降级(ctypes 不可用时 `_DevModeW`/`_user32` 不定义,`set_resolution` 等返回安全失败值)——坏环境只损失分辨率切换功能,不再拖垮整个程序启动;正常环境行为完全不变
+- tkinter 版 spec 原本已含 `ffi.dll`,无需改动
+
+### 验证
+
+- 源环境(miniconda3)`import ctypes` 正常;display_ctrl 正常路径 `current_resolution()` 读到真实分辨率,模拟 ctypes 不可用的降级路径(supported_modes=[]、set_resolution 返回失败元组)全部安全
+- `run_tests.py` 184 项全过;重新打包后 `archive_viewer -l` 确认 `_ctypes.pyd` 与 `ffi.dll` 均在 onefile exe 内,根因消除
+- 注:exe 清单要求管理员(UAC),宿主 shell 非管理员无法命令行拉起自检,最终请双击 exe 确认能正常进主界面
+
+---
+
+## 2026-09-12 · 新功能：运行时自动切换分辨率（适配仅支持 16:9 的开源脚本）
+
+背景：用户屏幕 2560×1600（16:10），MAA/BetterGI/三月七助手/一条龙等开源脚本普遍只适配 16:9（1080P/2K），在此分辨率下脚本运行失败。实测该机屏幕同时支持 1920×1080 与 2560×1440（均 165Hz）。
+
+### 方案
+
+- 新增逻辑模块 `display_ctrl.py`（无 UI 依赖）：`current_resolution()`（**双偏移容错解析**：本机 GameViewer 间接显示驱动经 CDD 路径返回的 DEVMODE 缓冲自 dmLogPixels 起整体 +8 字节（dmSize=188，标准 212），宽/高真实位于 172/176 而非标准 164/168，故标准偏移优先、+8 兜底、再回退 GetSystemMetrics）、`set_resolution()`（**优先用驱动返回的原样缓冲改宽高**——找到当前分辨率所在偏移组，只改那一组 + dmFields，其余字节不动；实测标准输入会被拒 BADMODE=-2，此法可行。切换后复核 current_resolution 确认生效）、`apply_for_run()`/`restore_if_needed()`（原始分辨率落盘 `display_state.json`，崩溃后下次启动自动恢复；恢复失败保留文件重试）
+- Qt 接线：`run_controller.py` 开跑前按 `settings["run_resolution"]` 切换、finally 恢复（含停止/异常）；`app.py` 启动崩溃恢复、运行中关窗兜底恢复、未开启自动切换且当前非 16:9 时开始前弹提示（定时触发走日志不弹窗）；`settings_page.py` 新增「运行时分辨率」（不切换/1920×1080/2560×1440，默认不切换）
+- tkinter 版最小接线（同一 settings 键，行为对齐）：`_finish_preflight` worker 切换/finally 恢复、`App.__init__` 启动恢复、`start_run` 预警；无 UI 设置项
+
+### 验证
+
+- `tests/test_display_ctrl.py` 14 项（假 user32：标准/偏移解析、偏移定位、状态文件往返、已是目标 no-op、不支持不落盘、恢复失败保留重试、先恢复再切换）
+- 真机端到端：2560×1600 → apply 1920×1080（实测生效）→ restore → 2560×1600，状态文件清除
+- 全量回归 184 项测试通过；`--smoke` 通过；tkinter 版编译通过
+
+---
+
+## 2026-09-12 · 定时任务:每天到点弹倒计时确认框,确认/归零开跑、跳过则放弃本次(Qt 版)
+
+背景:用户希望每天固定时间自动跑串行队列,但怕挂机时突然开跑抢鼠标——到点先弹**倒计时确认框**:点「立即运行」或等倒计时归零 → 开跑;点「跳过」(或 Esc) → 本次不运行,明天同一时刻再问。对应 TODO P2-1,采用**应用内每日定时**(非 Windows 任务计划程序),前提是助手保持开启(可最小化)。
+
+### 新增/改动
+
+- **新模块 `schedule_core.py`(纯逻辑,与 UI 解耦)**:`parse_hhmm` 时刻解析、`next_daily_occurrence(t, now)` 下次触发时刻(今天的时刻已过→明天;恰好等于 now 视为已过,避免保存设置瞬间秒级重合立刻弹窗)、`countdown_bounds` 秒数夹取(10~600)、`schedule_config` 读取归一化配置。设置键:`schedule_enabled` / `schedule_time`("HH:MM",默认 04:00)/ `schedule_countdown_sec`(默认 60)
+- **`ui_qt/dialogs.py` 新增 `ScheduleCountdownDialog`**:模态确认框,显示定时时刻 + 将运行的游戏列表 + 大字倒计时;内部 1s QTimer 归零自动 accept;「跳过本次」/Esc → reject
+- **`ui_qt/app.py` 主窗口接入**:`MainWindow.__init__` 起 1s `_sched_timer` 轮询 `_sched_tick`;到点先推进 `_sched_next` 到明天(确认框打开期间不重复触发)再 `_fire_scheduled`;弹框前若最小化则 `showNormal`+`activateWindow`;**忙碌/无勾选任务/确认框异常 → 本次自动跳过并写日志**。运行条空闲态显示「下次定时 MM-DD HH:MM」
+- **定时触发的前检查语义**:`start_run(scheduled=False)` 新增形参;`_on_preflight_done` 中定时触发的 warn 级警告(非管理员/进程占用等)**不弹窗询问,写日志自动通过**(否则挂机人不在会被 QMessageBox 卡死);error 级仍然阻断弹窗。开始按钮 connect 改 lambda,避免 `clicked(bool)` 的 checked 落进 `scheduled` 形参
+- **`ui_qt/settings_page.py` 设置页新增「定时任务」区**:启用开关 + QTimeEdit(HH:mm) + 倒计时秒数 QSpinBox,任一变化写回 settings 并 `main.schedule_resync()` 重算
+- 帮助页补「定时任务」说明段
+
+### 验证
+
+- 全量 `run_tests.py` 170 项通过(新增 `tests/test_schedule_core.py` 13 项纯逻辑 + `test_ui_qt.py` 9 项离屏:resync/tick 推进/到点三分支/确认框归零 accept 与 reject;测试注入假插件列表、关窗前还原内存 settings 不写回真实 settings.json)
+- 离屏端到端 ×2(临时脚本,已删):真实 1s 调度器 → 真实倒计时框 ①归零自动 accept → `start_run(scheduled=True)` ②模拟点「跳过」→ 不开跑、`_sched_next` 推进到明天
+- `--smoke` 冒烟通过;tkinter 版(游戏助手.pyw)未加此功能,仅 Qt 版提供
+
+---
+
+## 2026-09-12 · 界面移植 PySide6:新增 ui_qt/ 包与 Qt 版入口(tkinter 版保留)
+
+背景:tkinter 版在 150% DPI 下窗口缩放仅 3.6fps(Tk 软件布局+GDI 渲染的结构性上限,见上一节),决定按社区主流路线迁移 Qt。**逻辑层(runner_core/ui_helpers/log_watcher/log_saver/preset_*/quick_fill/preflight/assistant_setup)零改动**,新旧版本共用 settings.json、plugins/*.json、logs/,tkinter 版完整保留可回退。
+
+### 新增文件
+
+- `ui_qt/` 包:`app.py`(MainWindow 外壳:侧栏导航/全局运行条/页面栈/窗口几何持久化/管理员状态/深色标题栏/AppUserModelID)、`run_controller.py`(Runner+preflight 守护线程,队列→Qt 信号,QTimer 33ms 排水,md 自动保存含 5 万行缓冲与 partial 语义)、`theme.py`(4 套主题→QSS、字号档)、`core_glue.py`(设置/插件读写、log_tag_for)、`home_page.py`(卡片列表:拖拽排序/启用/并行/▲▼/状态条/专注模式)、`log_panel.py`(QPlainTextEdit **maximumBlockCount(600)** 内置行数上限、级别着色、跟随、导入查看器)、`add_page.py`、`edit_page.py`、`wizard_page.py`、`settings_page.py`、`help_page.py`、`dialogs.py`(粘贴填充)、`PORTING.md`(契约)、`PARITY.md`(对等性清单)
+- 入口 `游戏助手Qt.pyw`;打包 `一键长草助手Qt.spec` + `build_exe_qt.bat`(排除 tkinter/PIL);测试 `tests/test_ui_qt.py`(离屏冒烟:主窗口构建/六页切换/日志 600 行上限)
+
+### 执行方式与验证
+
+- 3 个并行 Agent 按文件分工实现(A:外壳+运行链路,B:主页+日志,C:页面+对话框),主 Agent 出契约文档与桩骨架统一签名;Agent 间零交叉编辑,逻辑层与旧版零接触
+- 集成验证:全量 py_compile;`--smoke` 离屏冒烟;`run_tests.py` 148 项逻辑测试全过;tests/test_ui_qt 4 项全过;A 的 11 项运行链路自测(preflight 确认流/停止语义/并行事件/md 自动保存/partial/几何持久化)、B 的拖拽排序与跟随自测、C 的页面与线程信号自测全过
+- **性能实测(与 tkinter 相同方法学:1 万行日志、全速连续缩放)**:tkinter 修复前 2.0fps → 修复后 3.6fps → **Qt 版 19.0fps(52.7ms/次),提升 5.3 倍**;真实拖拽中 Qt 还会合并中间状态,观感更顺
+- 页面写运行日志统一走 `MainWindow.append_log()`(先入 LogStore 再上屏,导出/复制同源)
+
+### 有意差异(相对 tkinter 版)
+
+- 全局字体经 `app.setFont` 而非 QSS(Qt 中 QSS 字体会覆盖各处 setFont)
+- 主题/字号切换不重建窗口(重刷 QSS+字体+日志重着色);add/edit 为复用页(open_for 重填)
+- 运行条新增用时显示与运行中关闭确认;拖拽排序放宽为整卡可拖(按钮区除外)
+
+---
+
 ## 2026-09-12 · 窗口缩放卡顿根治：日志字体回退链 + 界面日志截断 + 画布同步节流
 
 背景：用户反馈拉伸窗口时 UI 明显卡顿。经端到端基准（加载真实程序模拟逐像素缩放、cProfile、组件二分、同轮交错对照）定位，**不是**此前怀疑的 Text 全量重折行（行数 600 与 1 万同耗），而是三个因素叠加。

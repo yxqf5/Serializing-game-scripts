@@ -176,6 +176,10 @@ UI 层新版(2026-07):**添加页深度探测调用 `resolve_all_candidates`**,�
 `check_plugins(plugins)` 返回 issue 列表(level: error|warn|info)。
 自检项:是否有勾选、是否管理员、路径是否存在、进程是否已在运行。
 
+### schedule_core.py(定时任务,2026-09-12 新增,Qt 版专用)
+纯逻辑:`schedule_config(settings)` 读归一化配置(设置键 `schedule_enabled` / `schedule_time` "HH:MM" 默认 04:00 / `schedule_countdown_sec` 默认 60,夹取 10~600);`next_daily_occurrence(t, now)` 算下次触发——今天的时刻已过→明天,**恰好等于 now 也视为已过**(避免保存设置的瞬间秒级重合立刻弹窗)。
+主窗口(`ui_qt/app.py`)起 1s QTimer 轮询 `_sched_tick`:到点先把 `_sched_next` 推进到明天(确认框打开期间不重复触发)再 `_fire_scheduled` → 弹 `ScheduleCountdownDialog`(倒计时归零或点「立即运行」→ `start_run(scheduled=True)`;点「跳过本次」/Esc → 本次放弃,明天再问);任务运行中/无勾选任务/弹框异常 → 自动跳过并写日志。**定时触发的 preflight warn 不弹窗、写日志自动通过**(挂机人不在,否则会被 QMessageBox 卡死),error 仍阻断。设置页「定时任务」区任一控件变化 → 写 settings + `main.schedule_resync()` 重算。需要助手保持开启(可最小化),关掉就不定时。
+
 ### quick_fill.py
 新手用不上,但对熟练用户是快速填写捷径。解析"键:值"文本,识别中英文别名(比如"启动器"、"launcher"、"路径"都映射到 `launcher` 字段)。
 

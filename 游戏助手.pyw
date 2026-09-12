@@ -49,6 +49,7 @@ RUN_LOG_BUFFER_MAX = 50000
 APP_ICON_PNG = resource_path("assets", "icons", "app.png")
 APP_ICON_ICO = resource_path("assets", "icons", "app.ico")
 import runner_core
+import display_ctrl
 import preset_catalog as pc
 from preset_resolver import (
     resolve_launcher, resolve_all_candidates,
@@ -228,6 +229,10 @@ class App(tk.Tk):
 
         self.configure(bg=self.t["bg"])
         os.makedirs(PLUGIN_DIR, exist_ok=True)
+        # 上次异常退出遗留的分辨率切换,启动时自动恢复(崩溃兜底)
+        _done, _msg = display_ctrl.restore_if_needed()
+        if _done:
+            print(_msg)
         log_saver.cleanup_old_logs(
             LOG_DIR, log_saver.retention_days(self.settings.get("log_retention", "month")))
         self._build_shell()
@@ -2759,6 +2764,16 @@ class App(tk.Tk):
         if not active:
             messagebox.showwarning("无法开始", "没有勾选任何游戏，请至少开启一个。", parent=self)
             return
+        # 未开自动切换且当前非 16:9:提醒(开源脚本普遍只适配 16:9)
+        if display_ctrl.parse_target(self.settings.get("run_resolution", "off")) is None:
+            cur = display_ctrl.current_resolution()
+            if cur and abs(cur[0] / cur[1] - 16 / 9) > 0.02:
+                if not messagebox.askyesno(
+                        "分辨率提示",
+                        "当前分辨率 %d×%d 不是 16:9，开源脚本可能无法运行。\n"
+                        "可在设置中写入 run_resolution（如 \"1920x1080\"）开启自动切换。\n仍要继续吗？" % cur,
+                        parent=self):
+                    return
 
         self._preflight_token += 1
         token = self._preflight_token
@@ -2813,6 +2828,17 @@ class App(tk.Tk):
         self._refresh_run_buttons()
 
         def worker():
+            # 运行时分辨率(适配只支持 16:9 的开源脚本):开跑前切换,
+            # 结束/停止/异常都经 finally 恢复;崩溃兜底由状态文件+下次启动恢复
+            display_switched = False
+            target = display_ctrl.parse_target(self.settings.get("run_resolution", "off"))
+            if target:
+                ok, msg = display_ctrl.apply_for_run(*target)
+                if ok:
+                    display_switched = True
+                    self._enqueue_log(msg)
+                else:
+                    self._enqueue_log("[警告] %s(脚本可能无法运行)" % msg, level="warn")
             runner = runner_core.Runner(self._enqueue_log, self.stop_event,
                                         self._enqueue_run_event,
                                         daily_state_file=DAILY_STATE_FILE)
@@ -2820,6 +2846,11 @@ class App(tk.Tk):
                 runner.run_all(active)
             except Exception as e:
                 self._enqueue_log("发生错误：%s" % e, level="error")
+            finally:
+                if display_switched:
+                    done, msg = display_ctrl.restore_if_needed()
+                    self._enqueue_log(msg if done else "[警告] %s" % msg,
+                                      level=None if done else "warn")
             self.log_queue.put(("__DONE__", None, None))
 
         self.run_thread = threading.Thread(target=worker, daemon=True)
